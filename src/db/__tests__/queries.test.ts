@@ -10,6 +10,8 @@ import {
   insertThought,
   searchThoughts,
   listThoughts,
+  countThoughts,
+  getThoughtById,
   getThoughtStats,
   updateThought,
   deleteThought,
@@ -202,6 +204,42 @@ describe("listThoughts", () => {
     expect(sql).toContain("created_by =");
   });
 
+  it("applies OFFSET for pagination", async () => {
+    const { pool, mockQuery } = createMockPool();
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+
+    await listThoughts(pool, {}, 20, 40);
+
+    const sql = mockQuery.mock.calls[0]![0] as string;
+    const params = mockQuery.mock.calls[0]![1] as unknown[];
+    expect(sql).toContain("OFFSET");
+    expect(params).toContain(20);
+    expect(params).toContain(40);
+  });
+
+  it("defaults to limit 50 offset 0", async () => {
+    const { pool, mockQuery } = createMockPool();
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+
+    await listThoughts(pool, {});
+
+    const params = mockQuery.mock.calls[0]![1] as unknown[];
+    expect(params).toContain(50);
+    expect(params).toContain(0);
+  });
+
+  it("filters by tags_contain against the first content line only", async () => {
+    const { pool, mockQuery } = createMockPool();
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+
+    await listThoughts(pool, { tags_contain: "lesson:open" });
+
+    const sql = mockQuery.mock.calls[0]![0] as string;
+    const params = mockQuery.mock.calls[0]![1] as unknown[];
+    expect(sql).toContain("split_part(content, E'\\n', 1) ILIKE");
+    expect(params).toContain("%lesson:open%");
+  });
+
   it("includes archived when requested", async () => {
     const { pool, mockQuery } = createMockPool();
     mockQuery.mockResolvedValueOnce({ rows: [] });
@@ -210,6 +248,61 @@ describe("listThoughts", () => {
 
     const sql = mockQuery.mock.calls[0]![0] as string;
     expect(sql).not.toContain("archived = false");
+  });
+});
+
+// ─── countThoughts ──────────────────────────────────────────────────
+
+describe("countThoughts", () => {
+  it("counts with the same filters as listThoughts", async () => {
+    const { pool, mockQuery } = createMockPool();
+    mockQuery.mockResolvedValueOnce({ rows: [{ count: "87" }] });
+
+    const total = await countThoughts(pool, { tags_contain: "lesson:open" });
+
+    const sql = mockQuery.mock.calls[0]![0] as string;
+    expect(sql).toContain("COUNT(*)");
+    expect(sql).toContain("split_part(content, E'\\n', 1) ILIKE");
+    expect(total).toBe(87);
+  });
+
+  it("returns 0 on empty result", async () => {
+    const { pool, mockQuery } = createMockPool();
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+
+    const total = await countThoughts(pool, {});
+    expect(total).toBe(0);
+  });
+});
+
+// ─── getThoughtById ─────────────────────────────────────────────────
+
+describe("getThoughtById", () => {
+  it("selects by id and returns the row", async () => {
+    const { pool, mockQuery } = createMockPool();
+    const row = {
+      id: "11111111-2222-3333-4444-555555555555",
+      content: "tags: test\n\nbody",
+      metadata: {},
+      created_at: new Date(),
+    };
+    mockQuery.mockResolvedValueOnce({ rows: [row] });
+
+    const result = await getThoughtById(pool, row.id);
+
+    const sql = mockQuery.mock.calls[0]![0] as string;
+    const params = mockQuery.mock.calls[0]![1] as unknown[];
+    expect(sql).toContain("WHERE id = $1");
+    expect(params).toEqual([row.id]);
+    expect(result).toEqual(row);
+  });
+
+  it("returns null when not found", async () => {
+    const { pool, mockQuery } = createMockPool();
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+
+    const result = await getThoughtById(pool, "11111111-2222-3333-4444-555555555555");
+    expect(result).toBeNull();
   });
 });
 

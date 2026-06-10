@@ -52,6 +52,8 @@ export interface ListFilters {
   project?: string;
   created_by?: string;
   include_archived?: boolean;
+  /** Case-insensitive substring match against the first line of content (the tags: line). */
+  tags_contain?: string;
 }
 
 // ─── Insert ──────────────────────────────────────────────────────────
@@ -110,11 +112,12 @@ export async function searchThoughts(
 
 // ─── Filtered List ───────────────────────────────────────────────────
 
-export async function listThoughts(
-  pool: pg.Pool,
-  filters: ListFilters,
-  limit: number = 50
-): Promise<ThoughtRow[]> {
+/** Build the WHERE clause + params shared by listThoughts and countThoughts. */
+function buildListConditions(filters: ListFilters): {
+  whereClause: string;
+  params: unknown[];
+  idx: number;
+} {
   const conditions: string[] = [];
   const params: unknown[] = [];
   let idx = 0;
@@ -157,25 +160,76 @@ export async function listThoughts(
     params.push(filters.created_by);
   }
 
+  if (filters.tags_contain) {
+    idx++;
+    // Match against the first line of content only (the canonical tags: line),
+    // so prose mentions of a tag elsewhere in the body don't false-positive.
+    conditions.push(`split_part(content, E'\\n', 1) ILIKE $${idx}`);
+    params.push(`%${filters.tags_contain}%`);
+  }
+
   if (!filters.include_archived) {
     conditions.push(`(archived = false OR archived IS NULL)`);
   }
 
-  idx++;
-  params.push(limit);
-
   const whereClause = conditions.length > 0 ? conditions.join(" AND ") : "TRUE";
+  return { whereClause, params, idx };
+}
+
+export async function listThoughts(
+  pool: pg.Pool,
+  filters: ListFilters,
+  limit: number = 50,
+  offset: number = 0
+): Promise<ThoughtRow[]> {
+  const { whereClause, params, idx } = buildListConditions(filters);
+
+  const limitIdx = idx + 1;
+  const offsetIdx = idx + 2;
+  params.push(limit, offset);
 
   const { rows } = await pool.query<ThoughtRow>(
     `SELECT id, content, metadata, created_by, created_at
      FROM thoughts
      WHERE ${whereClause}
      ORDER BY created_at DESC
-     LIMIT $${idx}`,
+     LIMIT $${limitIdx}
+     OFFSET $${offsetIdx}`,
     params
   );
 
   return rows;
+}
+
+/** Count thoughts matching the same filters as listThoughts (for pagination totals). */
+export async function countThoughts(
+  pool: pg.Pool,
+  filters: ListFilters
+): Promise<number> {
+  const { whereClause, params } = buildListConditions(filters);
+
+  const { rows } = await pool.query<{ count: string }>(
+    `SELECT COUNT(*) AS count FROM thoughts WHERE ${whereClause}`,
+    params
+  );
+
+  return parseInt(rows[0]?.count ?? "0", 10);
+}
+
+// ─── Get by ID ───────────────────────────────────────────────────────
+
+export async function getThoughtById(
+  pool: pg.Pool,
+  id: string
+): Promise<ThoughtRow | null> {
+  const { rows } = await pool.query<ThoughtRow>(
+    `SELECT id, content, metadata, project, created_by, archived, supersedes, created_at
+     FROM thoughts
+     WHERE id = $1`,
+    [id]
+  );
+
+  return rows[0] ?? null;
 }
 
 // ─── Statistics ──────────────────────────────────────────────────────

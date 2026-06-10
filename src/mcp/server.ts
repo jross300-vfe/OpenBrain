@@ -1,7 +1,7 @@
 /**
  * MCP Server for Open Brain.
- * Exposes seven tools: search_thoughts, list_thoughts, capture_thought, thought_stats,
- * update_thought, delete_thought, capture_thoughts (batch).
+ * Exposes eight tools: search_thoughts, list_thoughts, get_thought, capture_thought,
+ * thought_stats, update_thought, delete_thought, capture_thoughts (batch).
  *
  * Uses the official @modelcontextprotocol/sdk TypeScript SDK.
  */
@@ -18,6 +18,8 @@ import {
   insertThought,
   searchThoughts,
   listThoughts,
+  countThoughts,
+  getThoughtById,
   getThoughtStats,
   updateThought,
   deleteThought,
@@ -133,7 +135,45 @@ export function createMcpServer(): Server {
               type: "string",
               description: "Filter results to thoughts created by a specific user",
             },
+            limit: {
+              type: "integer",
+              description:
+                "Maximum results per page (default: 50). Prefer small pages (10-25) on large corpora — full thought bodies are big, and oversized responses may overflow client-side buffers.",
+              default: 50,
+            },
+            offset: {
+              type: "integer",
+              description:
+                "Number of results to skip, for pagination (default: 0). Results are ordered most-recent-first; page with limit+offset until the returned count is less than limit, or use the total field.",
+              default: 0,
+            },
+            tags_contain: {
+              type: "string",
+              description:
+                "Case-insensitive substring filter against the FIRST line of content only (the canonical 'tags:' line), e.g. 'lesson:open'. Prose mentions of a tag deeper in the body do not match.",
+            },
+            minimal: {
+              type: "boolean",
+              description:
+                "When true, return only id, created_at, and the first line of content (the tags: line) per thought — ~10x smaller payload. Use for enumeration, then fetch full bodies via get_thought.",
+              default: false,
+            },
           },
+        },
+      },
+      {
+        name: "get_thought",
+        description:
+          "Fetch a single thought by its UUID, returning the full content and metadata. Companion to list_thoughts minimal mode: enumerate cheaply, then fetch full bodies one at a time.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            id: {
+              type: "string",
+              description: "UUID of the thought to fetch",
+            },
+          },
+          required: ["id"],
         },
       },
       {
@@ -314,22 +354,85 @@ export function createMcpServer(): Server {
             project: args?.project as string | undefined,
             created_by: args?.created_by as string | undefined,
             include_archived: (args?.include_archived as boolean) ?? false,
+            tags_contain: args?.tags_contain as string | undefined,
           };
 
-          const results = await listThoughts(pool, filters);
+          const limit = Math.max(1, (args?.limit as number) ?? 50);
+          const offset = Math.max(0, (args?.offset as number) ?? 0);
+          const minimal = (args?.minimal as boolean) ?? false;
 
-          const formatted = results.map((r) => ({
-            id: r.id,
-            content: r.content,
-            metadata: r.metadata,
-            created_at: r.created_at.toISOString(),
-          }));
+          const [results, total] = await Promise.all([
+            listThoughts(pool, filters, limit, offset),
+            countThoughts(pool, filters),
+          ]);
+
+          const formatted = results.map((r) =>
+            minimal
+              ? {
+                  id: r.id,
+                  tags_line: r.content.split("\n", 1)[0] ?? "",
+                  created_at: r.created_at.toISOString(),
+                }
+              : {
+                  id: r.id,
+                  content: r.content,
+                  metadata: r.metadata,
+                  created_at: r.created_at.toISOString(),
+                }
+          );
 
           return {
             content: [
               {
                 type: "text" as const,
-                text: JSON.stringify({ count: formatted.length, results: formatted }, null, 2),
+                text: JSON.stringify(
+                  { count: formatted.length, total, offset, limit, results: formatted },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+
+        // ── get_thought ──
+        case "get_thought": {
+          const id = args?.id as string;
+
+          if (!UUID_RE.test(id)) {
+            return {
+              content: [{ type: "text" as const, text: "Error: id must be a valid UUID" }],
+              isError: true,
+            };
+          }
+
+          const thought = await getThoughtById(pool, id);
+
+          if (!thought) {
+            return {
+              content: [{ type: "text" as const, text: `Error: Thought not found: ${id}` }],
+              isError: true,
+            };
+          }
+
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    id: thought.id,
+                    content: thought.content,
+                    metadata: thought.metadata,
+                    project: thought.project ?? null,
+                    created_by: thought.created_by ?? null,
+                    archived: thought.archived ?? false,
+                    supersedes: thought.supersedes ?? null,
+                    created_at: thought.created_at.toISOString(),
+                  },
+                  null,
+                  2
+                ),
               },
             ],
           };
