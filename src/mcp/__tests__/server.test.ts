@@ -132,13 +132,15 @@ describe("MCP Server Tool Listing", () => {
     expect(statsTool.inputSchema.properties.created_by).toBeDefined();
   });
 
-  it("update_thought requires id and content", async () => {
+  it("update_thought requires only id; content and tags_line are optional alternatives", async () => {
     const server = createMcpServer();
     const handler = (server as any)._requestHandlers?.get("tools/list");
     const result = await handler({ method: "tools/list" });
 
     const updateTool = result.tools.find((t: any) => t.name === "update_thought");
-    expect(updateTool.inputSchema.required).toEqual(["id", "content"]);
+    expect(updateTool.inputSchema.required).toEqual(["id"]);
+    expect(updateTool.inputSchema.properties.content).toBeDefined();
+    expect(updateTool.inputSchema.properties.tags_line).toBeDefined();
   });
 
   it("delete_thought requires id", async () => {

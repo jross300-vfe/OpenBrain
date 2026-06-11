@@ -228,7 +228,7 @@ export function createMcpServer(): Server {
       {
         name: "update_thought",
         description:
-          "Update an existing thought's content. Re-generates embedding and re-extracts metadata automatically.",
+          "Update an existing thought. Provide `content` for a full-content update (re-generates embedding and re-extracts metadata), or `tags_line` to replace ONLY the first line of content (the canonical 'tags:' line) — the rest of the body and all metadata are left untouched (embedding is regenerated). Provenance metadata (source, provenance) always survives updates. Exactly one of content/tags_line is required.",
         inputSchema: {
           type: "object" as const,
           properties: {
@@ -238,10 +238,15 @@ export function createMcpServer(): Server {
             },
             content: {
               type: "string",
-              description: "New content for the thought",
+              description: "New full content for the thought (mutually exclusive with tags_line)",
+            },
+            tags_line: {
+              type: "string",
+              description:
+                "Replacement for the first line of content only, e.g. flipping 'lesson:open' to 'lesson:incorporated' in the tags line. Body and metadata untouched. (mutually exclusive with content)",
             },
           },
-          required: ["id", "content"],
+          required: ["id"],
         },
       },
       {
@@ -328,6 +333,7 @@ export function createMcpServer(): Server {
           );
 
           const formatted = results.map((r) => ({
+            id: r.id,
             content: r.content,
             metadata: r.metadata,
             similarity: Math.round(r.similarity * 1000) / 1000,
@@ -515,7 +521,8 @@ export function createMcpServer(): Server {
         // ── update_thought ──
         case "update_thought": {
           const id = args?.id as string;
-          const content = args?.content as string;
+          const content = args?.content as string | undefined;
+          const tagsLine = args?.tags_line as string | undefined;
 
           if (!UUID_RE.test(id)) {
             return {
@@ -524,13 +531,70 @@ export function createMcpServer(): Server {
             };
           }
 
-          // Re-generate embedding and re-extract metadata
-          const [embedding, metadata] = await Promise.all([
-            embedder.generateEmbedding(content),
-            embedder.extractMetadata(content),
-          ]);
+          if ((content === undefined) === (tagsLine === undefined)) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: "Error: provide exactly one of content or tags_line",
+                },
+              ],
+              isError: true,
+            };
+          }
 
-          const result = await updateThought(pool, id, content, embedding, metadata);
+          let result;
+          let responseType: string | undefined;
+          let responseTopics: string[] | undefined;
+          let mode: string;
+
+          if (tagsLine !== undefined) {
+            // Tag-only update: splice the first line, keep body + metadata as-is.
+            // No metadata re-extraction — a tag flip must never disturb
+            // type/topics/source/provenance. Embedding is regenerated because
+            // content (including the tags line) is what got embedded.
+            if (tagsLine.trim().length === 0 || tagsLine.includes("\n")) {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: "Error: tags_line must be a non-empty single line",
+                  },
+                ],
+                isError: true,
+              };
+            }
+
+            const thought = await getThoughtById(pool, id);
+            if (!thought) {
+              return {
+                content: [{ type: "text" as const, text: `Error: Thought not found: ${id}` }],
+                isError: true,
+              };
+            }
+
+            const newlineIdx = thought.content.indexOf("\n");
+            const body = newlineIdx === -1 ? "" : thought.content.slice(newlineIdx);
+            const newContent = tagsLine + body;
+
+            const embedding = await embedder.generateEmbedding(newContent);
+            result = await updateThought(pool, id, newContent, embedding, thought.metadata);
+            responseType = thought.metadata?.type;
+            responseTopics = thought.metadata?.topics;
+            mode = "tags_line";
+          } else {
+            // Full-content update: re-generate embedding and re-extract metadata.
+            // updateThought carries source + provenance over from the existing row.
+            const [embedding, metadata] = await Promise.all([
+              embedder.generateEmbedding(content!),
+              embedder.extractMetadata(content!),
+            ]);
+
+            result = await updateThought(pool, id, content!, embedding, metadata);
+            responseType = metadata.type;
+            responseTopics = metadata.topics;
+            mode = "content";
+          }
 
           return {
             content: [
@@ -539,9 +603,11 @@ export function createMcpServer(): Server {
                 text: JSON.stringify(
                   {
                     status: "updated",
+                    mode,
                     id: result.id,
-                    type: metadata.type,
-                    topics: metadata.topics,
+                    type: responseType,
+                    topics: responseTopics,
+                    source: result.metadata?.source ?? null,
                     updated_at: result.created_at.toISOString(),
                   },
                   null,

@@ -341,6 +341,35 @@ export async function getThoughtStats(
 
 // ─── Update ──────────────────────────────────────────────────────────
 
+/**
+ * Provenance-class metadata keys must survive updates. The update pipeline
+ * re-extracts metadata from content, which can never reproduce `source` or
+ * `provenance` — they describe where the thought CAME FROM, not what it says.
+ * Losing them breaks import-dedup identity (searchThoughtsBySource matches on
+ * metadata.source / provenance.origin) and nulls the generated columns
+ * source_file_hash / code_hash (derived from provenance.contentHash), which
+ * re-opens the duplicate-import window those hashes exist to close.
+ *
+ * Merge rule: keys carried over from the existing row unless the caller
+ * explicitly supplies a replacement value. Explicit app-code merge (not SQL
+ * `||`) so the preserved key set is visible and reviewable here.
+ */
+const PRESERVED_METADATA_KEYS = ["source", "provenance"] as const;
+
+export function mergePreservedMetadata(
+  existing: ThoughtMetadata | null | undefined,
+  incoming: ThoughtMetadata
+): ThoughtMetadata {
+  const merged: ThoughtMetadata = { ...incoming };
+  if (!existing) return merged;
+  for (const key of PRESERVED_METADATA_KEYS) {
+    if (merged[key] === undefined && existing[key] !== undefined) {
+      merged[key] = existing[key] as never;
+    }
+  }
+  return merged;
+}
+
 export async function updateThought(
   pool: pg.Pool,
   id: string,
@@ -350,12 +379,23 @@ export async function updateThought(
 ): Promise<ThoughtRow> {
   const embeddingStr = `[${embedding.join(",")}]`;
 
+  const existing = await pool.query<{ metadata: ThoughtMetadata | null }>(
+    `SELECT metadata FROM thoughts WHERE id = $1`,
+    [id]
+  );
+
+  if (!existing.rowCount || existing.rowCount === 0) {
+    throw new Error(`Thought not found: ${id}`);
+  }
+
+  const merged = mergePreservedMetadata(existing.rows[0]!.metadata, metadata);
+
   const { rows, rowCount } = await pool.query<ThoughtRow>(
     `UPDATE thoughts
      SET content = $2, embedding = $3::vector, metadata = $4::jsonb
      WHERE id = $1
      RETURNING id, content, metadata, project, archived, supersedes, created_at`,
-    [id, content, embeddingStr, JSON.stringify(metadata)]
+    [id, content, embeddingStr, JSON.stringify(merged)]
   );
 
   if (!rowCount || rowCount === 0) {

@@ -13,6 +13,7 @@ import {
   insertThought,
   searchThoughts,
   listThoughts,
+  getThoughtById,
   getThoughtStats,
   updateThought,
   deleteThought,
@@ -240,6 +241,7 @@ export function createApi(): Hono {
         query: body.query,
         count: results.length,
         results: results.map((r) => ({
+          id: r.id,
           content: r.content,
           metadata: r.metadata,
           similarity: Math.round(r.similarity * 1000) / 1000,
@@ -293,25 +295,65 @@ export function createApi(): Hono {
       return c.json({ error: "id must be a valid UUID" }, 400);
     }
 
-    const body = await c.req.json<{ content: string }>();
+    const body = await c.req.json<{ content?: string; tags_line?: string }>();
 
-    if (!body.content || body.content.trim().length === 0) {
-      return c.json({ error: "content is required" }, 400);
+    const hasContent = typeof body.content === "string" && body.content.trim().length > 0;
+    const hasTagsLine = typeof body.tags_line === "string";
+
+    if (hasContent === hasTagsLine) {
+      return c.json({ error: "provide exactly one of content or tags_line" }, 400);
     }
 
     try {
-      const [embedding, metadata] = await Promise.all([
-        embedder.generateEmbedding(body.content),
-        embedder.extractMetadata(body.content),
-      ]);
+      let result;
+      let responseType: string | undefined;
+      let responseTopics: string[] | undefined;
+      let mode: string;
 
-      const result = await updateThought(pool, id, body.content, embedding, metadata);
+      if (hasTagsLine) {
+        // Tag-only update: splice the first line, keep body + metadata as-is.
+        // No metadata re-extraction — a tag flip must never disturb
+        // type/topics/source/provenance. Embedding regenerated (content changed).
+        const tagsLine = body.tags_line!;
+        if (tagsLine.trim().length === 0 || tagsLine.includes("\n")) {
+          return c.json({ error: "tags_line must be a non-empty single line" }, 400);
+        }
+
+        const thought = await getThoughtById(pool, id);
+        if (!thought) {
+          return c.json({ error: `Thought not found: ${id}` }, 404);
+        }
+
+        const newlineIdx = thought.content.indexOf("\n");
+        const bodyText = newlineIdx === -1 ? "" : thought.content.slice(newlineIdx);
+        const newContent = tagsLine + bodyText;
+
+        const embedding = await embedder.generateEmbedding(newContent);
+        result = await updateThought(pool, id, newContent, embedding, thought.metadata);
+        responseType = thought.metadata?.type;
+        responseTopics = thought.metadata?.topics;
+        mode = "tags_line";
+      } else {
+        // Full-content update: re-embed + re-extract; updateThought carries
+        // source + provenance over from the existing row.
+        const [embedding, metadata] = await Promise.all([
+          embedder.generateEmbedding(body.content!),
+          embedder.extractMetadata(body.content!),
+        ]);
+
+        result = await updateThought(pool, id, body.content!, embedding, metadata);
+        responseType = metadata.type;
+        responseTopics = metadata.topics;
+        mode = "content";
+      }
 
       return c.json({
         status: "updated",
+        mode,
         id: result.id,
-        type: metadata.type,
-        topics: metadata.topics,
+        type: responseType,
+        topics: responseTopics,
+        source: result.metadata?.source ?? null,
         content: result.content,
       });
     } catch (err) {

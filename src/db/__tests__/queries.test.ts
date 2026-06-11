@@ -14,6 +14,7 @@ import {
   getThoughtById,
   getThoughtStats,
   updateThought,
+  mergePreservedMetadata,
   deleteThought,
   batchInsertThoughts,
   type ThoughtMetadata,
@@ -368,6 +369,8 @@ describe("updateThought", () => {
       supersedes: null,
       created_at: new Date(),
     };
+    // First call: SELECT existing metadata; second call: UPDATE
+    mockQuery.mockResolvedValueOnce({ rows: [{ metadata: { type: "decision" } }], rowCount: 1 });
     mockQuery.mockResolvedValueOnce({ rows: [row], rowCount: 1 });
 
     const result = await updateThought(
@@ -385,6 +388,101 @@ describe("updateThought", () => {
     await expect(
       updateThought(pool, "nonexistent", "content", [0.1], {})
     ).rejects.toThrow("Thought not found");
+  });
+
+  it("carries source + provenance over from the existing row (clobber regression)", async () => {
+    const { pool, mockQuery } = createMockPool();
+    const existingMetadata: ThoughtMetadata = {
+      type: "observation",
+      topics: ["old-topic"],
+      source: "session-75-clawdferret",
+      provenance: {
+        origin: "bulk-import",
+        original_id: "orig-42",
+        imported_at: "2026-05-01T00:00:00Z",
+      },
+    };
+    // Re-extracted metadata, as the embedder produces it: NO source/provenance.
+    const reExtracted: ThoughtMetadata = { type: "observation", topics: ["new-topic"] };
+
+    mockQuery.mockResolvedValueOnce({ rows: [{ metadata: existingMetadata }], rowCount: 1 });
+    mockQuery.mockResolvedValueOnce({
+      rows: [{ id: "abc-123", content: "updated", metadata: {}, created_at: new Date() }],
+      rowCount: 1,
+    });
+
+    await updateThought(pool, "abc-123", "updated", [0.1], reExtracted);
+
+    // Inspect the metadata actually sent to the UPDATE statement.
+    const updateCall = mockQuery.mock.calls[1]!;
+    const sentMetadata = JSON.parse(updateCall[1][3]) as ThoughtMetadata;
+    expect(sentMetadata.source).toBe("session-75-clawdferret");
+    expect(sentMetadata.provenance).toEqual(existingMetadata.provenance);
+    // Re-extracted keys still win for non-preserved fields.
+    expect(sentMetadata.topics).toEqual(["new-topic"]);
+  });
+
+  it("caller-supplied source wins over the existing row's source", async () => {
+    const { pool, mockQuery } = createMockPool();
+    mockQuery.mockResolvedValueOnce({
+      rows: [{ metadata: { source: "old-source" } }],
+      rowCount: 1,
+    });
+    mockQuery.mockResolvedValueOnce({
+      rows: [{ id: "abc-123", content: "x", metadata: {}, created_at: new Date() }],
+      rowCount: 1,
+    });
+
+    await updateThought(pool, "abc-123", "x", [0.1], { source: "explicit-new-source" });
+
+    const sentMetadata = JSON.parse(mockQuery.mock.calls[1]![1][3]) as ThoughtMetadata;
+    expect(sentMetadata.source).toBe("explicit-new-source");
+  });
+
+  it("handles null existing metadata without throwing", async () => {
+    const { pool, mockQuery } = createMockPool();
+    mockQuery.mockResolvedValueOnce({ rows: [{ metadata: null }], rowCount: 1 });
+    mockQuery.mockResolvedValueOnce({
+      rows: [{ id: "abc-123", content: "x", metadata: {}, created_at: new Date() }],
+      rowCount: 1,
+    });
+
+    await updateThought(pool, "abc-123", "x", [0.1], { type: "observation" });
+
+    const sentMetadata = JSON.parse(mockQuery.mock.calls[1]![1][3]) as ThoughtMetadata;
+    expect(sentMetadata.type).toBe("observation");
+    expect(sentMetadata.source).toBeUndefined();
+  });
+});
+
+// ─── mergePreservedMetadata ─────────────────────────────────────────
+
+describe("mergePreservedMetadata", () => {
+  it("preserves source and provenance when incoming omits them", () => {
+    const existing: ThoughtMetadata = {
+      source: "s1",
+      provenance: { origin: "import" },
+      topics: ["a"],
+    };
+    const merged = mergePreservedMetadata(existing, { type: "idea", topics: ["b"] });
+    expect(merged).toEqual({
+      type: "idea",
+      topics: ["b"],
+      source: "s1",
+      provenance: { origin: "import" },
+    });
+  });
+
+  it("does not resurrect non-preserved keys", () => {
+    const existing: ThoughtMetadata = { people: ["alice"], dates: ["2026-01-01"] };
+    const merged = mergePreservedMetadata(existing, { type: "idea" });
+    expect(merged.people).toBeUndefined();
+    expect(merged.dates).toBeUndefined();
+  });
+
+  it("returns incoming unchanged when existing is null or undefined", () => {
+    expect(mergePreservedMetadata(null, { type: "idea" })).toEqual({ type: "idea" });
+    expect(mergePreservedMetadata(undefined, { source: "s" })).toEqual({ source: "s" });
   });
 });
 
