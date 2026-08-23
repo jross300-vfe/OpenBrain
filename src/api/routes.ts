@@ -23,6 +23,7 @@ import {
   type BatchThoughtInput,
 } from "../db/queries.js";
 import { getEmbedder } from "../embedder/index.js";
+import type { EmbedderPing } from "../embedder/types.js";
 import {
   validateCaptureInput,
   validateBatchInput,
@@ -53,7 +54,29 @@ export function createApi(): Hono {
 
   // ─── Health Check ────────────────────────────────────────────────
 
-  app.get("/health", (c) => {
+  /**
+   * Cached dependency probe (S275, task_1785713207341).
+   *
+   * The container HEALTHCHECK runs every 30s and a human may curl /health at any
+   * time, so the probe is cached: a healthcheck that hammers its dependency is a
+   * healthcheck that becomes part of the problem.
+   */
+  let depCache: { at: number; ping: EmbedderPing } | null = null;
+  const DEP_TTL_MS = 10_000;
+
+  async function probeDependency(): Promise<EmbedderPing> {
+    if (depCache && Date.now() - depCache.at < DEP_TTL_MS) return depCache.ping;
+    const ping: EmbedderPing = embedder.ping
+      ? await embedder.ping()
+      : // NOT PROBED, and it says so rather than defaulting to a pass. A provider
+        // with no free liveness endpoint (azure, openrouter) must not be billed
+        // every 30s just so a healthcheck can look thorough.
+        { provider: "unknown", reachable: null, ms: null, detail: "provider exposes no free liveness probe" };
+    depCache = { at: Date.now(), ping };
+    return ping;
+  }
+
+  app.get("/health", async (c) => {
     const capabilities = [
       "capture",
       "search",
@@ -68,11 +91,53 @@ export function createApi(): Hono {
       "embed-truncation-warning",
     ];
     if (isStrictIngestEnabled()) capabilities.push("strict-ingest");
+
+    // *** `status` DELIBERATELY STILL MEANS "THIS PROCESS IS UP". ***
+    // It is NOT widened to cover dependencies, because collect-ob1-health.mjs
+    // keys api_healthy off `status === "healthy"`, and ops-ob1.capability -- the
+    // estate's only `critical` seam -- derives its verdict from that. Widening it
+    // here would silently re-label a dead-ollama condition from `search-failed`
+    // to `api-unhealthy` on that seam. Same fact, different name, no announcement.
+    //
+    // What WAS wrong is that this endpoint reported nothing about its dependency
+    // at all, so a reader was actively misled during the S204 and S231 outages.
+    // `dependencies` fixes that without moving anyone's goalposts. The endpoint
+    // that actually FAILS is /health/deep, below.
+    const dependency = await probeDependency();
     return c.json({
       status: "healthy",
       service: "open-brain-api",
       capabilities,
+      dependencies: { embedder: dependency },
     });
+  });
+
+  /**
+   * Dependency-aware health, for the container HEALTHCHECK.
+   *
+   * *** THIS IS THE ONE THAT CAN GO RED. *** The Dockerfile HEALTHCHECK points
+   * here, so `docker inspect` finally reflects something that can fail --
+   * measured green through the S204 and S231 outages while search was dead.
+   *
+   * It proves REACHABILITY, not capability: a wedged runner answers /api/tags
+   * perfectly (S269). Complementary to ops-ob1.capability, never a substitute --
+   * what shipped there makes US know, this makes DOCKER act.
+   *
+   * A NOT-PROBED dependency is NOT a failure: a provider with no free liveness
+   * endpoint would otherwise be permanently unhealthy, which is the always-red
+   * class. Only a MEASURED false fails.
+   */
+  app.get("/health/deep", async (c) => {
+    const dependency = await probeDependency();
+    const degraded = dependency.reachable === false;
+    return c.json(
+      {
+        status: degraded ? "degraded" : "healthy",
+        service: "open-brain-api",
+        dependencies: { embedder: dependency },
+      },
+      degraded ? 503 : 200
+    );
   });
 
   // ─── Capture Memory ──────────────────────────────────────────────

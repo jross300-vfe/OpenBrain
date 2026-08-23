@@ -26,7 +26,10 @@ describe("assertUsableEmbedding", () => {
   it("*** an empty array is TRUTHY, so `if (!embedding)` would have passed it ***", () => {
     // Pins the reason the old per-provider guard failed. If this ever becomes
     // false the guard's rationale changed and the comment is a lie.
-    expect(!([] as unknown[])).toBe(false);
+    // Opaque to the compiler on purpose -- TS narrows a literal `![]` to
+    // "always truthy" and refuses to compile the very point being pinned.
+    const emptyish: unknown = [];
+    expect(!emptyish).toBe(false);
     expect(() => assertUsableEmbedding([], ctx)).toThrow();
   });
 

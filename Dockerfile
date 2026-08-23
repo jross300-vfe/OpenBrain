@@ -33,8 +33,14 @@ USER openbrain
 EXPOSE 8000 8080
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD wget -qO- http://localhost:8000/health || exit 1
+# S275 (task_1785713207341): points at /health/deep, NOT /health. /health is a
+# static handler that CANNOT FAIL -- measured green by `docker inspect` throughout
+# the S204 and S231 outages while search was dead. /health/deep probes the embedder
+# dependency and returns 503 when it is measurably unreachable, so wget exits
+# non-zero and Docker finally has something to act on. start-period widened to 30s:
+# a container marked unhealthy during normal startup teaches everyone to ignore it.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD wget -qO- http://localhost:8000/health/deep || exit 1
 
 # Run
 CMD ["node", "dist/index.js"]

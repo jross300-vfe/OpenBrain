@@ -33,13 +33,39 @@ export const DEFAULT_METADATA: ThoughtMetadataExtracted = {
   dates: [],
 };
 
+/**
+ * Result of a cheap dependency liveness probe. `reachable: null` means NOT
+ * PROBED -- never conflate it with `false`, which is a measured failure.
+ */
+export interface EmbedderPing {
+  provider: string;
+  reachable: boolean | null;
+  ms: number | null;
+  detail?: string;
+}
+
 export interface Embedder {
   /** Convert text to a vector embedding. */
   generateEmbedding(text: string): Promise<number[]>;
 
   /** Use an LLM to extract structured metadata from content. */
   extractMetadata(content: string): Promise<ThoughtMetadataExtracted>;
+
+  /**
+   * OPTIONAL cheap liveness probe of the backing service, for healthchecks.
+   *
+   * *** MUST NOT PERFORM INFERENCE AND MUST NOT COST MONEY. *** It runs every 30s
+   * from a container HEALTHCHECK; a probe that bills per call, or that loads a
+   * model, is a probe someone disables -- and a disabled healthcheck is worse
+   * than a shallow one because it looks deliberate.
+   *
+   * A provider that has no free liveness endpoint returns reachable: null rather
+   * than inventing one. NOT PROBED is an honest answer; a fabricated pass is not.
+   */
+  ping?(): Promise<EmbedderPing>;
 }
+
+
 
 export const METADATA_PROMPT = `Extract metadata from the following thought. Return JSON with:
 - type: one of the following:
