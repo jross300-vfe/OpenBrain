@@ -74,6 +74,49 @@ describe("content_hash generated column", () => {
   });
 });
 
+describe("content_hash on adversarial content", () => {
+  /**
+   * REGRESSION GUARD. The first version of migration 004 used sha256(content::bytea) --
+   * an I/O cast that parses text as a bytea LITERAL. Measured against the live 985-row
+   * corpus: 108 rows ERRORED and 1 row hashed to the WRONG value silently. It passed its
+   * throwaway test only because the test content was backslash-free ASCII.
+   *
+   * These cases are drawn from what the corpus actually contains: Windows paths, escape
+   * sequences, em-dashes. If someone "simplifies" the expression back, these go red.
+   */
+  const adversarial: [string, string][] = [
+    ["windows path", String.raw`C:\Projects\claude-workshop\Tools\gather.py`],
+    ["escape sequences", String.raw`a\nb\tc\x41d` + "\\e"],
+    ["bytea hex literal", String.raw`\x48656c6c6f`],
+    ["bytea escape octal", String.raw`\001\002 and a trailing ` + "\\"],
+    ["em-dash and unicode", "session \u2014 ruled S275 \u2014 985 rows, ferret \ud83e\udda6, caf\u00e9"],
+    ["regex-ish", String.raw`^\d{4}-\d{2}-\d{2}$ | grep -oP '\K.*'`],
+  ];
+
+  for (const [label, payload] of adversarial) {
+    it(`stores a correct sha256 for ${label}`, async () => {
+      const text = `__idem_test_adv_${label.replace(/\W/g, "")}_${tag}
+${payload}`;
+      const { row } = await captureThought(pool, text, EMB(), {});
+      const { rows } = await pool.query<{ content_hash: string }>(
+        "SELECT content_hash FROM thoughts WHERE id = $1",
+        [row.id]
+      );
+      expect(rows[0]!.content_hash).toBe(contentHash(text));
+    });
+  }
+
+  it("dedups adversarial content on retry (the hash is usable, not just present)", async () => {
+    const text = `__idem_test_adv_retry_${tag}
+${String.raw`C:\ProjectsA
+`}`;
+    const first = await captureThought(pool, text, EMB(), {});
+    const retry = await captureThought(pool, text, EMB(), {});
+    expect(retry.deduplicated).toBe(true);
+    expect(retry.row.id).toBe(first.row.id);
+  });
+});
+
 describe("captureThought dedup", () => {
   it("collapses an immediate retry of identical content onto the original row", async () => {
     const text = `__idem_test_retry_${tag}`;

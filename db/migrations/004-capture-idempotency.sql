@@ -19,11 +19,27 @@
 
 BEGIN;
 
+-- pgcrypto supplies digest(text,'sha256'), which is IMMUTABLE and hashes the text in the
+-- server encoding (UTF8 here).
+--
+-- *** DO NOT "SIMPLIFY" THIS TO sha256(content::bytea). *** That was the first attempt and
+-- it is wrong twice over: text::bytea is an I/O cast that parses the text as a bytea
+-- LITERAL, so a Windows path or any other backslash sequence is invalid escape syntax.
+-- Measured against the live 985-row corpus: 108 rows ERROR, and 1 row casts happily while
+-- producing a DIFFERENT digest from the true sha256 -- i.e. a permanently wrong hash with
+-- nothing to report it. The erroring rows are the lucky half; the silent one is the reason
+-- this comment exists.
+--
+-- convert_to(content,'UTF8') is CORRECT but only STABLE, so it cannot back a generated
+-- column. digest() is both correct and immutable; proven equal to
+-- sha256(convert_to(content,'UTF8')) across all 985 live rows, 0 disagreements.
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 -- A. Generated column. GENERATED rather than app-populated on purpose: it is correct
 --    for all pre-existing rows the moment it lands, and it CANNOT drift from content.
 ALTER TABLE thoughts
   ADD COLUMN IF NOT EXISTS content_hash TEXT
-    GENERATED ALWAYS AS (encode(sha256(content::bytea), 'hex')) STORED;
+    GENERATED ALWAYS AS (encode(digest(content, 'sha256'), 'hex')) STORED;
 
 -- B. Lookup index for the dedup probe. Composite on the scope the probe filters by,
 --    created_at DESC so the window scan hits the newest candidate first.
