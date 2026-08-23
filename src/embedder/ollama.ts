@@ -8,6 +8,7 @@ import {
   type ThoughtMetadataExtracted,
   DEFAULT_METADATA,
   METADATA_PROMPT,
+  assertUsableEmbedding,
 } from "./types.js";
 
 export class OllamaEmbedder implements Embedder {
@@ -43,15 +44,14 @@ export class OllamaEmbedder implements Embedder {
     }
 
     const data = (await response.json()) as { embeddings?: number[][] };
-    const embedding = data.embeddings?.[0];
 
-    if (!embedding || embedding.length === 0) {
-      throw new Error(
-        `Ollama returned no vector for this content — likely empty, whitespace-only, or unsupported by ${this.embedModel} (content_bytes=${Buffer.byteLength(text, "utf8")})`
-      );
-    }
-
-    return embedding;
+    // S275: one shared guard for every provider. This path already refused an
+    // empty vector; it did NOT check dimensionality or finiteness, and the other
+    // two providers did not even check emptiness.
+    return assertUsableEmbedding(data.embeddings?.[0], {
+      model: this.embedModel,
+      contentBytes: Buffer.byteLength(text, "utf8"),
+    });
   }
 
   async extractMetadata(content: string): Promise<ThoughtMetadataExtracted> {

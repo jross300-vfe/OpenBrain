@@ -8,6 +8,7 @@ import {
   type ThoughtMetadataExtracted,
   DEFAULT_METADATA,
   METADATA_PROMPT,
+  assertUsableEmbedding,
 } from "./types.js";
 
 export class AzureOpenAIEmbedder implements Embedder {
@@ -64,13 +65,13 @@ export class AzureOpenAIEmbedder implements Embedder {
     const data = (await response.json()) as {
       data: Array<{ embedding: number[] }>;
     };
-    const embedding = data.data[0]?.embedding;
-
-    if (!embedding) {
-      throw new Error("Azure OpenAI returned empty embedding");
-    }
-
-    return embedding;
+    // S275 (task_1787400000011): the previous guard here was `if (!embedding)`,
+    // and *** AN EMPTY ARRAY IS TRUTHY *** -- so a 200 carrying `[]` sailed
+    // straight through and stored a thought permanently unfindable by search.
+    return assertUsableEmbedding(data.data[0]?.embedding, {
+      model: this.embedDeployment,
+      contentBytes: Buffer.byteLength(text, "utf8"),
+    });
   }
 
   async extractMetadata(content: string): Promise<ThoughtMetadataExtracted> {
