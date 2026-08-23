@@ -34,22 +34,22 @@ vi.mock("../../embedder/index.js", () => ({
 }));
 
 // Mock query functions
-const mockInsertThought = vi.fn();
+const mockCaptureThought = vi.fn();
 const mockSearchThoughts = vi.fn();
 const mockListThoughts = vi.fn();
 const mockGetThoughtStats = vi.fn();
 const mockUpdateThought = vi.fn();
 const mockDeleteThought = vi.fn();
-const mockBatchInsertThoughts = vi.fn();
+const mockCaptureThoughts = vi.fn();
 
 vi.mock("../../db/queries.js", () => ({
-  insertThought: (...args: any[]) => mockInsertThought(...args),
+  captureThought: (...args: any[]) => mockCaptureThought(...args),
   searchThoughts: (...args: any[]) => mockSearchThoughts(...args),
   listThoughts: (...args: any[]) => mockListThoughts(...args),
   getThoughtStats: (...args: any[]) => mockGetThoughtStats(...args),
   updateThought: (...args: any[]) => mockUpdateThought(...args),
   deleteThought: (...args: any[]) => mockDeleteThought(...args),
-  batchInsertThoughts: (...args: any[]) => mockBatchInsertThoughts(...args),
+  captureThoughts: (...args: any[]) => mockCaptureThoughts(...args),
 }));
 
 import { createApi } from "../routes.js";
@@ -73,12 +73,15 @@ describe("REST API Routes", () => {
   // ─── POST /memories ────────────────────────────────────────────────
 
   it("POST /memories accepts project and supersedes", async () => {
-    mockInsertThought.mockResolvedValueOnce({
-      id: "abc-123",
-      content: "test",
-      metadata: { type: "decision" },
-      project: "plan-forge",
-      created_at: new Date(),
+    mockCaptureThought.mockResolvedValueOnce({
+      row: {
+        id: "abc-123",
+        content: "test",
+        metadata: { type: "decision" },
+        project: "plan-forge",
+        created_at: new Date(),
+      },
+      deduplicated: false,
     });
 
     const res = await app.request("/memories", {
@@ -229,9 +232,9 @@ describe("REST API Routes", () => {
   // ─── POST /memories/batch ──────────────────────────────────────────
 
   it("POST /memories/batch returns array of results", async () => {
-    mockBatchInsertThoughts.mockResolvedValueOnce([
-      { id: "id-1", content: "thought 1", metadata: {}, project: "proj", created_at: new Date() },
-      { id: "id-2", content: "thought 2", metadata: {}, project: "proj", created_at: new Date() },
+    mockCaptureThoughts.mockResolvedValueOnce([
+      { row: { id: "id-1", content: "thought 1", metadata: {}, project: "proj", created_at: new Date() }, deduplicated: false },
+      { row: { id: "id-2", content: "thought 2", metadata: {}, project: "proj", created_at: new Date() }, deduplicated: false },
     ]);
 
     const res = await app.request("/memories/batch", {

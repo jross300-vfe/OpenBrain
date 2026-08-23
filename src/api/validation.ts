@@ -44,6 +44,12 @@ export interface ValidatedCapture {
   project?: string;
   created_by?: string;
   supersedes?: string;
+  /**
+   * Optional client-supplied idempotency key. Exact dedup semantics regardless of the
+   * server's time window -- for callers that can reliably REUSE the key across a retry.
+   * The server's content-hash dedup is the load-bearing mechanism; this is additive.
+   */
+  idempotency_key?: string;
   /** Caller-provided metadata to merge on top of auto-extracted metadata. */
   metadata: Record<string, unknown>;
   warnings: CaptureWarning[];
@@ -56,6 +62,7 @@ const KNOWN_TOP_LEVEL = new Set([
   "project",
   "created_by",
   "supersedes",
+  "idempotency_key",
   "metadata",
 ]);
 
@@ -241,6 +248,10 @@ export function validateCaptureInput(
     project,
     created_by,
     supersedes,
+    idempotency_key:
+      typeof body.idempotency_key === "string" && body.idempotency_key.trim().length > 0
+        ? body.idempotency_key
+        : undefined,
     metadata,
     warnings,
   };

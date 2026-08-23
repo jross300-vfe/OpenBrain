@@ -3,6 +3,8 @@
  * All queries use parameterized SQL (no interpolation).
  */
 
+import { createHash } from "node:crypto";
+
 import type pg from "pg";
 
 // ─── Types ───────────────────────────────────────────────────────────
@@ -56,8 +58,111 @@ export interface ListFilters {
   tags_contain?: string;
 }
 
+// --- Capture idempotency -------------------------------------------
+
+/**
+ * A client timeout on capture does NOT cancel the server write: the row commits, the
+ * client sees a transport error, and a retry writes a SECOND copy. Measured on the live
+ * corpus at S275 -- all five uncontaminated exact-duplicate groups were pairs written
+ * 39-98 SECONDS apart, byte-identical, three of them sharing one first-write timestamp
+ * (a batch retried wholesale).
+ *
+ * The window is what separates a RETRY from a DELIBERATE re-capture. It is policy, not
+ * an invariant, so it lives here and NOT as a unique constraint on content_hash --
+ * permanent uniqueness would forbid ever legitimately re-capturing the same text.
+ *
+ * 10 minutes against an observed worst case of 98 seconds: ~6x headroom, while still far
+ * below any plausible interval at which a human deliberately re-captures identical text.
+ * Widening this trades duplicate-suppression for silently swallowing real writes.
+ */
+export const DEDUP_WINDOW_MINUTES = 10;
+
+export interface CaptureOptions {
+  /** Overrides DEDUP_WINDOW_MINUTES. 0 disables content-hash dedup entirely. */
+  dedupWindowMinutes?: number;
+  /**
+   * Optional client-supplied key. Exact semantics, independent of the window -- but it
+   * only helps a client that can REUSE the key across a retry, which is precisely what a
+   * timed-out agent cannot be relied upon to do. The content hash is the load-bearing
+   * mechanism; this is the belt to its braces.
+   */
+  idempotencyKey?: string;
+}
+
+export interface CaptureResult {
+  row: ThoughtRow;
+  /** True when an existing row was returned instead of inserting a new one. */
+  deduplicated: boolean;
+}
+
+/** sha256 hex of content. Verified byte-identical to the DB's generated column. */
+export function contentHash(content: string): string {
+  return createHash("sha256").update(content, "utf8").digest("hex");
+}
+
+const RETURNING_COLS =
+  "id, content, metadata, project, created_by, archived, supersedes, created_at";
+
+/**
+ * Look for an existing row this capture would duplicate.
+ *
+ * Scope is (content_hash, project, created_by) within the window. `source` is
+ * deliberately NOT part of the identity -- a retry carries the same source anyway, and
+ * two sources capturing byte-identical text inside ten minutes is a duplicate worth
+ * collapsing regardless.
+ *
+ * IS NOT DISTINCT FROM, never `=`: project and created_by are nullable and `NULL = NULL`
+ * is NULL, so `=` would silently never match the very common unscoped rows -- a dedup
+ * that quietly does nothing for most captures.
+ */
+async function findDuplicate(
+  client: pg.PoolClient,
+  hash: string,
+  project: string | null,
+  created_by: string | null,
+  windowMinutes: number,
+  idempotencyKey?: string
+): Promise<ThoughtRow | null> {
+  if (idempotencyKey) {
+    const { rows } = await client.query<ThoughtRow>(
+      `SELECT ${RETURNING_COLS} FROM thoughts WHERE idempotency_key = $1 LIMIT 1`,
+      [idempotencyKey]
+    );
+    if (rows[0]) return rows[0];
+  }
+
+  if (windowMinutes <= 0) return null;
+
+  const { rows } = await client.query<ThoughtRow>(
+    `SELECT ${RETURNING_COLS}
+       FROM thoughts
+      WHERE content_hash = $1
+        AND project    IS NOT DISTINCT FROM $2
+        AND created_by IS NOT DISTINCT FROM $3
+        AND created_at > now() - ($4 || ' minutes')::interval
+      ORDER BY created_at ASC
+      LIMIT 1`,
+    [hash, project, created_by, String(windowMinutes)]
+  );
+  return rows[0] ?? null;
+}
+
+/**
+ * Serialise concurrent captures of identical content so check-then-insert cannot
+ * interleave. Transaction-scoped: released on COMMIT/ROLLBACK, so there is no leak path.
+ */
+async function lockOnHash(client: pg.PoolClient, hash: string): Promise<void> {
+  await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [hash]);
+}
+
+
 // ─── Insert ──────────────────────────────────────────────────────────
 
+/**
+ * RAW insert -- NO dedup, NO transaction. Prefer captureThought() for anything reached by
+ * a network client: this path cannot tell a retry from a new thought. Kept exported
+ * because it is the honest primitive and the unit tests exercise it directly.
+ */
 export async function insertThought(
   pool: pg.Pool,
   content: string,
@@ -492,6 +597,9 @@ export interface BatchThoughtInput {
   created_by?: string;
 }
 
+/**
+ * RAW batch insert -- NO dedup. Prefer captureThoughts(). See insertThought's note.
+ */
 export async function batchInsertThoughts(
   pool: pg.Pool,
   thoughts: BatchThoughtInput[]
@@ -530,4 +638,123 @@ export async function batchInsertThoughts(
   }
 
   return results;
+}
+
+
+// --- Deduplicating capture (the front door) ------------------------
+
+/**
+ * Capture a thought, collapsing a retry of a recent identical capture onto the row it
+ * would have duplicated.
+ *
+ * Returns the EXISTING row with deduplicated:true rather than erroring, so a client is
+ * free to retry any timeout safely -- which is the whole point. Refusing the write would
+ * have preserved the duplicate-avoidance while destroying the retry-safety it exists for.
+ */
+export async function captureThought(
+  pool: pg.Pool,
+  content: string,
+  embedding: number[],
+  metadata: ThoughtMetadata,
+  project?: string,
+  supersedes?: string,
+  created_by?: string,
+  options: CaptureOptions = {}
+): Promise<CaptureResult> {
+  const hash = contentHash(content);
+  const windowMinutes = options.dedupWindowMinutes ?? DEDUP_WINDOW_MINUTES;
+  const proj = project ?? null;
+  const by = created_by ?? null;
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await lockOnHash(client, hash);
+
+    const existing = await findDuplicate(client, hash, proj, by, windowMinutes, options.idempotencyKey);
+    if (existing) {
+      await client.query("COMMIT");
+      return { row: existing, deduplicated: true };
+    }
+
+    const { rows } = await client.query<ThoughtRow>(
+      `INSERT INTO thoughts (content, embedding, metadata, project, supersedes, created_by, idempotency_key)
+       VALUES ($1, $2::vector, $3::jsonb, $4, $5, $6, $7)
+       RETURNING ${RETURNING_COLS}`,
+      [
+        content,
+        `[${embedding.join(",")}]`,
+        JSON.stringify(metadata),
+        proj,
+        supersedes ?? null,
+        by,
+        options.idempotencyKey ?? null,
+      ]
+    );
+
+    await client.query("COMMIT");
+    return { row: rows[0]!, deduplicated: false };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Batch counterpart. Dedups PER ITEM, not per batch: the S275 evidence shows whole
+ * batches retried wholesale (three duplicate pairs sharing one first-write timestamp),
+ * and a partially-succeeded batch must converge on re-send rather than duplicating the
+ * items that did land.
+ *
+ * One transaction and one advisory lock per item, taken in a STABLE order (sorted by
+ * hash) so two concurrent overlapping batches cannot deadlock by grabbing the same two
+ * locks in opposite orders.
+ */
+export async function captureThoughts(
+  pool: pg.Pool,
+  thoughts: BatchThoughtInput[],
+  options: CaptureOptions = {}
+): Promise<CaptureResult[]> {
+  const windowMinutes = options.dedupWindowMinutes ?? DEDUP_WINDOW_MINUTES;
+  const hashes = thoughts.map((t) => contentHash(t.content));
+  const results: CaptureResult[] = new Array(thoughts.length);
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    for (const h of [...new Set(hashes)].sort()) {
+      await lockOnHash(client, h);
+    }
+
+    for (let i = 0; i < thoughts.length; i++) {
+      const t = thoughts[i]!;
+      const proj = t.project ?? null;
+      const by = t.created_by ?? null;
+
+      const existing = await findDuplicate(client, hashes[i]!, proj, by, windowMinutes);
+      if (existing) {
+        results[i] = { row: existing, deduplicated: true };
+        continue;
+      }
+
+      const { rows } = await client.query<ThoughtRow>(
+        `INSERT INTO thoughts (content, embedding, metadata, project, created_by)
+         VALUES ($1, $2::vector, $3::jsonb, $4, $5)
+         RETURNING ${RETURNING_COLS}`,
+        [t.content, `[${t.embedding.join(",")}]`, JSON.stringify(t.metadata), proj, by]
+      );
+      results[i] = { row: rows[0]!, deduplicated: false };
+    }
+
+    await client.query("COMMIT");
+    return results;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
 }

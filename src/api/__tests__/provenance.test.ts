@@ -36,25 +36,25 @@ vi.mock("../../embedder/index.js", () => ({
 }));
 
 // Mock query functions
-const mockInsertThought = vi.fn();
+const mockCaptureThought = vi.fn();
 const mockSearchThoughts = vi.fn();
 const mockListThoughts = vi.fn();
 const mockGetThoughtById = vi.fn();
 const mockGetThoughtStats = vi.fn();
 const mockUpdateThought = vi.fn();
 const mockDeleteThought = vi.fn();
-const mockBatchInsertThoughts = vi.fn();
+const mockCaptureThoughts = vi.fn();
 const mockSearchThoughtsBySource = vi.fn();
 
 vi.mock("../../db/queries.js", () => ({
-  insertThought: (...args: any[]) => mockInsertThought(...args),
+  captureThought: (...args: any[]) => mockCaptureThought(...args),
   searchThoughts: (...args: any[]) => mockSearchThoughts(...args),
   listThoughts: (...args: any[]) => mockListThoughts(...args),
   getThoughtById: (...args: any[]) => mockGetThoughtById(...args),
   getThoughtStats: (...args: any[]) => mockGetThoughtStats(...args),
   updateThought: (...args: any[]) => mockUpdateThought(...args),
   deleteThought: (...args: any[]) => mockDeleteThought(...args),
-  batchInsertThoughts: (...args: any[]) => mockBatchInsertThoughts(...args),
+  captureThoughts: (...args: any[]) => mockCaptureThoughts(...args),
   searchThoughtsBySource: (...args: any[]) => mockSearchThoughtsBySource(...args),
 }));
 
@@ -139,12 +139,15 @@ describe("Provenance API Features", () => {
     });
 
     it("accepts valid source and project", async () => {
-      mockInsertThought.mockResolvedValueOnce({
-        id: "abc-123",
-        content: "test",
-        metadata: { type: "observation" },
-        project: "my-proj",
-        created_at: new Date(),
+      mockCaptureThought.mockResolvedValueOnce({
+        row: {
+          id: "abc-123",
+          content: "test",
+          metadata: { type: "observation" },
+          project: "my-proj",
+          created_at: new Date(),
+        },
+        deduplicated: false,
       });
 
       const res = await app.request("/memories", {
@@ -160,12 +163,15 @@ describe("Provenance API Features", () => {
     });
 
     it("allows omitting source and project", async () => {
-      mockInsertThought.mockResolvedValueOnce({
-        id: "abc-456",
-        content: "test",
-        metadata: { type: "observation" },
-        project: null,
-        created_at: new Date(),
+      mockCaptureThought.mockResolvedValueOnce({
+        row: {
+          id: "abc-456",
+          content: "test",
+          metadata: { type: "observation" },
+          project: null,
+          created_at: new Date(),
+        },
+        deduplicated: false,
       });
 
       const res = await app.request("/memories", {

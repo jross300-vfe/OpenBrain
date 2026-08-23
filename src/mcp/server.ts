@@ -15,7 +15,7 @@ import {
 
 import { getPool } from "../db/connection.js";
 import {
-  insertThought,
+  captureThought,
   searchThoughts,
   listThoughts,
   countThoughts,
@@ -23,7 +23,7 @@ import {
   getThoughtStats,
   updateThought,
   deleteThought,
-  batchInsertThoughts,
+  captureThoughts,
   type ListFilters,
   type BatchThoughtInput,
 } from "../db/queries.js";
@@ -202,6 +202,13 @@ export function createMcpServer(): Server {
             created_by: {
               type: "string",
               description: "User who created this thought (optional, for multi-developer provenance)",
+            },
+            idempotency_key: {
+              type: "string",
+              description:
+                "Optional. Reuse the SAME key when retrying a capture that timed out, to guarantee " +
+                "one row. Not required for safety: identical content captured within 10 minutes is " +
+                "deduplicated automatically and returns the original id with deduplicated:true.",
             },
           },
           required: ["content"],
@@ -466,8 +473,9 @@ export function createMcpServer(): Server {
           ]);
 
           const fullMetadata = { ...autoMetadata, ...input.metadata, source: input.source };
-          const result = await insertThought(
-            pool, input.content, embedding, fullMetadata, input.project, input.supersedes, input.created_by
+          const { row: result, deduplicated } = await captureThought(
+            pool, input.content, embedding, fullMetadata, input.project, input.supersedes,
+            input.created_by, { idempotencyKey: input.idempotency_key }
           );
 
           logWarnings(input.warnings, {
@@ -485,8 +493,12 @@ export function createMcpServer(): Server {
             type: "text" as const,
             text: JSON.stringify(
               {
-                status: "captured",
+                // "deduplicated" is NOT a failure: this request matched a recent
+                // identical capture, so the ORIGINAL row is returned. Do NOT retry, and
+                // do NOT treat the repeated id as an error -- that is the fix working.
+                status: deduplicated ? "deduplicated" : "captured",
                 id: result.id,
+                deduplicated,
                 type: (fullMetadata.type as string | undefined) ?? autoMetadata.type,
                 topics: (fullMetadata.topics as string[] | undefined) ?? autoMetadata.topics,
                 people: (fullMetadata.people as string[] | undefined) ?? autoMetadata.people,
@@ -673,7 +685,7 @@ export function createMcpServer(): Server {
             })
           );
 
-          const results = await batchInsertThoughts(pool, processed);
+          const results = await captureThoughts(pool, processed);
 
           for (const w of batch.warnings) {
             console.warn(
@@ -695,11 +707,12 @@ export function createMcpServer(): Server {
             });
           }
 
-          const formatted = results.map((r, i) => ({
+          const formatted = results.map(({ row: r, deduplicated }, i) => ({
             id: r.id,
             content: r.content,
             metadata: r.metadata,
             captured_at: r.created_at.toISOString(),
+            deduplicated,
             warnings: batch.items[i]?.warnings ?? [],
           }));
 
@@ -722,6 +735,7 @@ export function createMcpServer(): Server {
             text: JSON.stringify(
               {
                 count: formatted.length,
+                deduplicated_count: formatted.filter((f) => f.deduplicated).length,
                 envelope_warnings: batch.warnings,
                 results: formatted,
               },

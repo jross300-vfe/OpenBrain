@@ -10,14 +10,14 @@ import { logger } from "hono/logger";
 
 import { getPool } from "../db/connection.js";
 import {
-  insertThought,
+  captureThought,
   searchThoughts,
   listThoughts,
   getThoughtById,
   getThoughtStats,
   updateThought,
   deleteThought,
-  batchInsertThoughts,
+  captureThoughts,
   searchThoughtsBySource,
   type ListFilters,
   type BatchThoughtInput,
@@ -97,8 +97,9 @@ export function createApi(): Hono {
       // Caller-supplied metadata wins over auto-extracted; both lose to `source` which
       // is canonicalised at the top level so we can index on it.
       const fullMetadata = { ...autoMetadata, ...input.metadata, source: input.source };
-      const result = await insertThought(
-        pool, input.content, embedding, fullMetadata, input.project, input.supersedes, input.created_by
+      const { row: result, deduplicated } = await captureThought(
+        pool, input.content, embedding, fullMetadata, input.project, input.supersedes,
+        input.created_by, { idempotencyKey: input.idempotency_key }
       );
 
       logWarnings(input.warnings, {
@@ -115,6 +116,9 @@ export function createApi(): Hono {
         people: (fullMetadata.people as string[] | undefined) ?? autoMetadata.people,
         project: result.project,
         captured_at: result.created_at.toISOString(),
+        // True when this request duplicated a recent identical capture and the ORIGINAL
+        // row was returned. Not an error: it is what makes retrying a timeout safe.
+        deduplicated,
         warnings: input.warnings,
       });
     } catch (err) {
@@ -157,7 +161,7 @@ export function createApi(): Hono {
         })
       );
 
-      const results = await batchInsertThoughts(pool, processed);
+      const results = await captureThoughts(pool, processed);
 
       for (const w of batch.warnings) {
         console.warn(
@@ -181,13 +185,15 @@ export function createApi(): Hono {
 
       return c.json({
         count: results.length,
+        deduplicated_count: results.filter((r) => r.deduplicated).length,
         envelope_warnings: batch.warnings,
-        results: results.map((r, i) => ({
+        results: results.map(({ row: r, deduplicated }, i) => ({
           id: r.id,
           content: r.content,
           metadata: r.metadata,
           project: r.project,
           captured_at: r.created_at.toISOString(),
+          deduplicated,
           warnings: batch.items[i]?.warnings ?? [],
         })),
       });
