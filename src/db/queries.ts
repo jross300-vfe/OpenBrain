@@ -7,6 +7,8 @@ import { createHash } from "node:crypto";
 
 import type pg from "pg";
 
+import { parseTagLine, type LessonValue } from "./tagline.js";
+
 // ─── Types ───────────────────────────────────────────────────────────
 
 export interface ThoughtMetadata {
@@ -32,6 +34,12 @@ export interface ThoughtRow {
   archived?: boolean;
   supersedes?: string | null;
   created_at: Date;
+  // ─ tag-line columns (migration 006, dual-written since E2/S278) ─
+  class?: string | null;
+  lesson?: LessonValue | null;
+  session?: number | null;
+  incorporated_into?: string | null;
+  duplicate_of?: string | null;
 }
 
 export interface SearchResult extends ThoughtRow {
@@ -101,7 +109,60 @@ export function contentHash(content: string): string {
 }
 
 const RETURNING_COLS =
-  "id, content, metadata, project, created_by, archived, supersedes, created_at";
+  "id, content, metadata, project, created_by, archived, supersedes, created_at, " +
+  "class, lesson, session, incorporated_into, duplicate_of";
+
+/**
+ * The tag-line columns, written by every insert path. Declared ONCE so the four
+ * INSERTs cannot drift apart; `tagline-coverage.test.ts` asserts at the source
+ * level that no `INSERT INTO thoughts` omits them, so a fifth write path added
+ * later fails the suite instead of silently writing NULLs.
+ */
+const TAGLINE_COLS = "class, lesson, session, incorporated_into, duplicate_of";
+
+/**
+ * Resolve a tag-line `duplicate-of:` reference (an 8-char id prefix) to a full
+ * uuid. Returns null unless it matches EXACTLY ONE row.
+ *
+ * Ambiguity is refused rather than guessed: 8 hex chars is a 4.3e9 space, which
+ * is collision-free across the 1,001 rows measured at S278 (~0.01%) but reaches
+ * ~1.2% at 10k. When it eventually collides, this returns null and the reference
+ * stays visible in the tag line -- a missing edge, never a WRONG one pointing at
+ * an unrelated thought.
+ */
+async function resolveDuplicateRef(
+  q: Pick<pg.Pool, "query"> | pg.PoolClient,
+  ref: string | null,
+  excludeId?: string
+): Promise<string | null> {
+  if (!ref) return null;
+  const { rows } = await q.query<{ id: string }>(
+    `SELECT id::text AS id FROM thoughts WHERE id::text LIKE $1 LIMIT 2`,
+    [`${ref}%`]
+  );
+  if (rows.length !== 1) return null;
+  // A thought cannot be a duplicate of itself. The FK would happily accept it
+  // and the row would then inflate the duplicate-rate signal S181 keeps
+  // duplicates around to measure -- a self-edge is worse than a missing one.
+  if (excludeId && rows[0]!.id === excludeId) return null;
+  return rows[0]!.id;
+}
+
+/** Parse + resolve in one step: the tuple every write path binds. */
+async function taglineValues(
+  q: Pick<pg.Pool, "query"> | pg.PoolClient,
+  content: string,
+  excludeId?: string
+): Promise<[string | null, LessonValue | null, number | null, string | null, string | null]> {
+  const t = parseTagLine(content);
+  return [
+    t.class,
+    t.lesson,
+    t.session,
+    t.incorporated_into,
+    await resolveDuplicateRef(q, t.duplicate_of_ref, excludeId),
+  ];
+}
 
 /**
  * Look for an existing row this capture would duplicate.
@@ -173,12 +234,13 @@ export async function insertThought(
   created_by?: string
 ): Promise<ThoughtRow> {
   const embeddingStr = `[${embedding.join(",")}]`;
+  const tags = await taglineValues(pool, content);
 
   const { rows } = await pool.query<ThoughtRow>(
-    `INSERT INTO thoughts (content, embedding, metadata, project, supersedes, created_by)
-     VALUES ($1, $2::vector, $3::jsonb, $4, $5, $6)
-     RETURNING id, content, metadata, project, created_by, archived, supersedes, created_at`,
-    [content, embeddingStr, JSON.stringify(metadata), project ?? null, supersedes ?? null, created_by ?? null]
+    `INSERT INTO thoughts (content, embedding, metadata, project, supersedes, created_by, ${TAGLINE_COLS})
+     VALUES ($1, $2::vector, $3::jsonb, $4, $5, $6, $7, $8, $9, $10, $11)
+     RETURNING ${RETURNING_COLS}`,
+    [content, embeddingStr, JSON.stringify(metadata), project ?? null, supersedes ?? null, created_by ?? null, ...tags]
   );
 
   return rows[0]!;
@@ -495,12 +557,22 @@ export async function updateThought(
 
   const merged = mergePreservedMetadata(existing.rows[0]!.metadata, metadata);
 
+  // *** RE-PARSE ON EVERY UPDATE. *** This is the path `process-reflection-queue`
+  // §Tag-flip reaches (PUT /memories/:id in tags_line splice mode) to move a
+  // thought from `lesson:open` to a disposition. If the columns were not
+  // recomputed here, a flip would change the tag line while the column kept the
+  // OLD value -- two truths for one fact, which is precisely what [HOFFA]'s
+  // "one truth, one display" ruling (S278) forbids. A flip that edits only the
+  // string is the same defect wearing different clothes.
+  const tags = await taglineValues(pool, content, id);
+
   const { rows, rowCount } = await pool.query<ThoughtRow>(
     `UPDATE thoughts
-     SET content = $2, embedding = $3::vector, metadata = $4::jsonb
+     SET content = $2, embedding = $3::vector, metadata = $4::jsonb,
+         class = $5, lesson = $6, session = $7, incorporated_into = $8, duplicate_of = $9
      WHERE id = $1
-     RETURNING id, content, metadata, project, archived, supersedes, created_at`,
-    [id, content, embeddingStr, JSON.stringify(merged)]
+     RETURNING ${RETURNING_COLS}`,
+    [id, content, embeddingStr, JSON.stringify(merged), ...tags]
   );
 
   if (!rowCount || rowCount === 0) {
@@ -613,16 +685,19 @@ export async function batchInsertThoughts(
     for (const thought of thoughts) {
       const embeddingStr = `[${thought.embedding.join(",")}]`;
 
+      const tags = await taglineValues(client, thought.content);
+
       const { rows } = await client.query<ThoughtRow>(
-        `INSERT INTO thoughts (content, embedding, metadata, project, created_by)
-         VALUES ($1, $2::vector, $3::jsonb, $4, $5)
-         RETURNING id, content, metadata, project, created_by, archived, supersedes, created_at`,
+        `INSERT INTO thoughts (content, embedding, metadata, project, created_by, ${TAGLINE_COLS})
+         VALUES ($1, $2::vector, $3::jsonb, $4, $5, $6, $7, $8, $9, $10)
+         RETURNING ${RETURNING_COLS}`,
         [
           thought.content,
           embeddingStr,
           JSON.stringify(thought.metadata),
           thought.project ?? null,
           thought.created_by ?? null,
+          ...tags,
         ]
       );
 
@@ -677,9 +752,11 @@ export async function captureThought(
       return { row: existing, deduplicated: true };
     }
 
+    const tags = await taglineValues(client, content);
+
     const { rows } = await client.query<ThoughtRow>(
-      `INSERT INTO thoughts (content, embedding, metadata, project, supersedes, created_by, idempotency_key)
-       VALUES ($1, $2::vector, $3::jsonb, $4, $5, $6, $7)
+      `INSERT INTO thoughts (content, embedding, metadata, project, supersedes, created_by, idempotency_key, ${TAGLINE_COLS})
+       VALUES ($1, $2::vector, $3::jsonb, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        RETURNING ${RETURNING_COLS}`,
       [
         content,
@@ -689,6 +766,7 @@ export async function captureThought(
         supersedes ?? null,
         by,
         options.idempotencyKey ?? null,
+        ...tags,
       ]
     );
 
@@ -740,11 +818,13 @@ export async function captureThoughts(
         continue;
       }
 
+      const tags = await taglineValues(client, t.content);
+
       const { rows } = await client.query<ThoughtRow>(
-        `INSERT INTO thoughts (content, embedding, metadata, project, created_by)
-         VALUES ($1, $2::vector, $3::jsonb, $4, $5)
+        `INSERT INTO thoughts (content, embedding, metadata, project, created_by, ${TAGLINE_COLS})
+         VALUES ($1, $2::vector, $3::jsonb, $4, $5, $6, $7, $8, $9, $10)
          RETURNING ${RETURNING_COLS}`,
-        [t.content, `[${t.embedding.join(",")}]`, JSON.stringify(t.metadata), proj, by]
+        [t.content, `[${t.embedding.join(",")}]`, JSON.stringify(t.metadata), proj, by, ...tags]
       );
       results[i] = { row: rows[0]!, deduplicated: false };
     }
