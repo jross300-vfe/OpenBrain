@@ -329,9 +329,45 @@ function buildListConditions(filters: ListFilters): {
 
   if (filters.tags_contain) {
     idx++;
-    // Match against the first line of content only (the canonical tags: line),
-    // so prose mentions of a tag elsewhere in the body don't false-positive.
-    conditions.push(`split_part(content, E'\\n', 1) ILIKE $${idx}`);
+    // M3 (S280) — READ THE COLUMNS, not only the string.
+    //
+    // Still scoped to line 1 / the columns rather than the whole body, so prose
+    // mentions of a tag elsewhere don't false-positive. What changed is that the
+    // PROMOTED tokens are now matched against migration 006's columns as well.
+    //
+    // *** THIS IS DELIBERATELY AN `OR`, AND THE OR IS THE WHOLE DESIGN. ***
+    // Only five tokens were promoted to columns; `topic:`, `role:`, `dp:` and
+    // friends still live nowhere but the line. A column-ONLY predicate would
+    // therefore have silently broken every filter on an unpromoted token --
+    // trading one blind spot for another and calling it a migration. The union
+    // is a strict SUPERSET of the old behaviour: nothing that matched before
+    // stops matching, and rows whose tag line is not on line 1 become reachable
+    // for the first time.
+    //
+    // MEASURED BEFORE CHANGING ANYTHING (S280, live corpus, the direction an
+    // aggregate cannot show you -- see instrument-honesty.md §Sabotage-proving
+    // obligation (2) rider):
+    //     line=t, col=t  ->  434     line=f, col=t  ->  25   (gained)
+    //     line=f, col=f  ->  553     line=t, col=f  ->   0   (LOST -- none)
+    // The empty `line=t, col=f` cell is the gate. Had it been non-zero this
+    // change would have LOST rows while appearing to add 25.
+    //
+    // The projection below is hand-rolled rather than shared with a renderer
+    // because C1 (the tag line as a rendered projection of the columns) is not
+    // built yet. WHEN C1 LANDS, THIS MUST SWITCH TO THAT RENDERER -- two
+    // independent spellings of one projection is the second-truth defect the
+    // column promotion exists to end. concat_ws skips NULLs, and `||` against a
+    // NULL column yields NULL, so an unset column contributes nothing.
+    conditions.push(
+      `(split_part(content, E'\\n', 1) ILIKE $${idx}` +
+        ` OR concat_ws(' ',` +
+        ` 'class:' || class,` +
+        ` 'lesson:' || lesson,` +
+        ` 'session:S' || session,` +
+        ` 'incorporated_into:' || incorporated_into,` +
+        ` 'duplicate-of:' || duplicate_of` +
+        `) ILIKE $${idx})`,
+    );
     params.push(`%${filters.tags_contain}%`);
   }
 

@@ -229,7 +229,13 @@ describe("listThoughts", () => {
     expect(params).toContain(0);
   });
 
-  it("filters by tags_contain against the first content line only", async () => {
+  // M3 (S280): tags_contain matches line 1 OR the migration-006 columns.
+  // BOTH halves are asserted, because dropping EITHER is a real regression with
+  // opposite symptoms -- losing the line half silently breaks every unpromoted
+  // token (topic:, role:, dp:), losing the column half silently restores the
+  // denominator hole M3 exists to close. A test naming only one half would pass
+  // through the very change it is supposed to catch.
+  it("filters by tags_contain against line 1 AND the promoted columns", async () => {
     const { pool, mockQuery } = createMockPool();
     mockQuery.mockResolvedValueOnce({ rows: [] });
 
@@ -238,7 +244,23 @@ describe("listThoughts", () => {
     const sql = mockQuery.mock.calls[0]![0] as string;
     const params = mockQuery.mock.calls[0]![1] as unknown[];
     expect(sql).toContain("split_part(content, E'\\n', 1) ILIKE");
-    expect(params).toContain("%lesson:open%");
+    expect(sql).toContain("'lesson:' || lesson");
+    expect(sql).toContain("'class:' || class");
+    expect(sql).toMatch(/ILIKE \$\d+\)?\s*OR concat_ws/);
+    // one placeholder, used by both halves -- two would silently double-bind
+    expect(params.filter((p) => p === "%lesson:open%")).toHaveLength(1);
+  });
+
+  it("still scopes tags_contain to line 1, never the whole body", async () => {
+    const { pool, mockQuery } = createMockPool();
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+
+    await listThoughts(pool, { tags_contain: "lesson:open" });
+
+    const sql = mockQuery.mock.calls[0]![0] as string;
+    // the guard the original comment existed for: a bare `content ILIKE` would
+    // false-positive on any prose mention of the token further down the body.
+    expect(sql).not.toMatch(/[^)]\bcontent ILIKE/);
   });
 
   it("includes archived when requested", async () => {
@@ -264,6 +286,10 @@ describe("countThoughts", () => {
     const sql = mockQuery.mock.calls[0]![0] as string;
     expect(sql).toContain("COUNT(*)");
     expect(sql).toContain("split_part(content, E'\\n', 1) ILIKE");
+    // countThoughts MUST carry the M3 column half too -- a count computed over a
+    // narrower predicate than the list it counts is the denominator hole again,
+    // one level down, and it would render as a plausible number rather than an error.
+    expect(sql).toContain("'lesson:' || lesson");
     expect(total).toBe(87);
   });
 
