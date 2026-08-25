@@ -9,7 +9,15 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { parseTagLine, isTagLine, LESSON_VALUES, type LessonValue } from "../tagline.js";
+import {
+  parseTagLine,
+  isTagLine,
+  LESSON_VALUES,
+  parseSourceSession,
+  resolveSession,
+  taglineSessionTiers,
+  type LessonValue,
+} from "../tagline.js";
 
 describe("parseTagLine — the ruled lesson set", () => {
   it("is SIX values, not five and not seven ([HOFFA], S278)", () => {
@@ -220,5 +228,118 @@ describe("parseTagLine — totality", () => {
       const v = parseTagLine(`class:c ${s}`).lesson;
       if (v !== null) expect(LESSON_VALUES).toContain(v as LessonValue);
     }
+  });
+});
+
+// ─── Session resolution (S281) ───────────────────────────────────────
+//
+// Fixtures are REAL rows and REAL sources from the live corpus, cited by id
+// prefix. The precedence assertions are the ruling itself; if they change, the
+// column has quietly gone back to meaning something else.
+
+describe("parseSourceSession — the capture session, from metadata.source", () => {
+  it.each([
+    ["session-186-clawdferret", 186],
+    ["session-186-clawdferret-hoffa-directive", 186],
+    ["clawdferret-S131", 131],
+    ["cowork-S113", 113],
+    ["S182 Hoffa directive during P2c residual ruling", 182],
+  ])("parses the live shape %s", (src, want) => {
+    expect(parseSourceSession(src)).toBe(want);
+  });
+
+  // Case-insensitivity is worth 27 rows across 11 sources. Measured, not assumed.
+  it.each([
+    ["cowork-s125", 125],
+    ["cowork-s121-close", 121],
+    ["clawdferret-s130", 130],
+    ["duke-sched-mcp-probe-s111", 111],
+  ])("parses the LOWERCASE shape %s (S281 widening)", (src, want) => {
+    expect(parseSourceSession(src)).toBe(want);
+  });
+
+  // FAIL-CLOSED. These are the whole live vocabulary of sources that name no
+  // session; if one of them starts yielding a number, the widening overreached.
+  it.each(["mcp", "duke-finance-specialist-v1-firstfire",
+           "research-pointer-ob1-3d-viz-DECISIONS",
+           "scheduled-task:duke-phase21-mcp-access-verify"])(
+    "refuses %s — no session is stated", (src) => {
+      expect(parseSourceSession(src)).toBeNull();
+    });
+
+  it("refuses null/empty/absent rather than guessing", () => {
+    expect(parseSourceSession(null)).toBeNull();
+    expect(parseSourceSession(undefined)).toBeNull();
+    expect(parseSourceSession("")).toBeNull();
+  });
+
+  it("does NOT match an s glued to preceding alphanumerics", () => {
+    expect(parseSourceSession("ABS123")).toBeNull();
+    expect(parseSourceSession("windows11")).toBeNull();
+  });
+
+  it("has NO upper bound — the same refusal parseTagLine makes", () => {
+    // The M1 backfill capped at 300. A constant like that is a silent expiry
+    // date; this must keep working at S301 and beyond.
+    expect(parseSourceSession("session-999-clawdferret")).toBe(999);
+  });
+});
+
+describe("resolveSession — the ruled precedence (S281)", () => {
+  const TAG = "class:instrument-honesty lesson:open";
+
+  it("TIER 1: source wins when it parses", () => {
+    expect(resolveSession("session-186-clawdferret", `${TAG} session:S210\n\nbody`)).toBe(186);
+  });
+
+  it("*** the token is a FALLBACK, not an override — the 2bb380da case ***", () => {
+    // Created 2026-07-23 at S159; source says S159; its own prose opens "S159 --";
+    // its tag line says session:S266 because S266 INCORPORATED it. Source must win,
+    // or an incorporation walk silently re-dates a thought captured 107 sessions earlier.
+    const content =
+      "class:deploy-discipline lesson:incorporated session:S266 S159 — WHEN A CHANGE...\n\nbody";
+    expect(resolveSession("S159", content)).toBe(159);
+  });
+
+  it("TIER 2: an explicit token answers when source cannot", () => {
+    expect(resolveSession("mcp", `${TAG} session:S244\n\nbody`)).toBe(244);
+    expect(resolveSession(null, `${TAG} datapoint:S275\n\nbody`)).toBe(275);
+  });
+
+  it("TIER 3: a bare S### answers when source AND token are both silent", () => {
+    // 11 live rows have source "mcp" and no explicit token; their tag line
+    // carries the ONLY correct session that exists for them. Dropping this tier
+    // would NULL every one of them.
+    expect(resolveSession("mcp", "class:tool-discipline dp:1 (S164) — a file-write...\n\nbody"))
+      .toBe(164);
+  });
+
+  it("TIER 4: NULL when nothing states a session", () => {
+    expect(resolveSession("mcp", `${TAG}\n\nbody`)).toBeNull();
+    expect(resolveSession(null, "just prose, no tag line at all")).toBeNull();
+  });
+
+  it("never reads a tag tier from a line that is not a tag line", () => {
+    // Prose mentioning S275 must not become a session just because it is line 1.
+    expect(resolveSession("mcp", "S275 was a busy session and nothing else\n\nbody")).toBeNull();
+  });
+
+  it("prefers the explicit token over a bare S on the SAME line", () => {
+    expect(resolveSession("mcp", `${TAG} session:S244 (extends S100)\n\nbody`)).toBe(244);
+  });
+});
+
+describe("taglineSessionTiers — the two line-1 tiers stay distinguishable", () => {
+  it("separates an explicit declaration from a bare observation", () => {
+    expect(taglineSessionTiers("class:x lesson:open session:S244 (extends S100)"))
+      .toEqual({ explicit: 244, bare: 244 });
+    expect(taglineSessionTiers("class:x lesson:open — S164 finding"))
+      .toEqual({ explicit: null, bare: 164 });
+    expect(taglineSessionTiers("class:x lesson:open"))
+      .toEqual({ explicit: null, bare: null });
+  });
+
+  it("returns both null for a non-tag line", () => {
+    expect(taglineSessionTiers("prose about S164")).toEqual({ explicit: null, bare: null });
   });
 });

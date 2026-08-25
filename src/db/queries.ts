@@ -7,7 +7,7 @@ import { createHash } from "node:crypto";
 
 import type pg from "pg";
 
-import { parseTagLine, type LessonValue } from "./tagline.js";
+import { parseTagLine, resolveSession, type LessonValue } from "./tagline.js";
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -152,13 +152,20 @@ async function resolveDuplicateRef(
 async function taglineValues(
   q: Pick<pg.Pool, "query"> | pg.PoolClient,
   content: string,
+  metadata: ThoughtMetadata | null | undefined,
   excludeId?: string
 ): Promise<[string | null, LessonValue | null, number | null, string | null, string | null]> {
   const t = parseTagLine(content);
   return [
     t.class,
     t.lesson,
-    t.session,
+    // *** NOT `t.session`. *** [HOFFA] ruled at S281 that `session` MEANS the
+    // capture session and is DERIVED from `metadata.source`, with the tag-line
+    // token demoted to a FALLBACK. `parseTagLine` stays pure over content (its
+    // M1 fixtures still pin it), so the tier logic composes here -- this is the
+    // one seam every write path already binds, which is why it is the one place
+    // the precedence needs to exist.
+    resolveSession(metadata?.source, content),
     t.incorporated_into,
     await resolveDuplicateRef(q, t.duplicate_of_ref, excludeId),
   ];
@@ -234,7 +241,7 @@ export async function insertThought(
   created_by?: string
 ): Promise<ThoughtRow> {
   const embeddingStr = `[${embedding.join(",")}]`;
-  const tags = await taglineValues(pool, content);
+  const tags = await taglineValues(pool, content, metadata);
 
   const { rows } = await pool.query<ThoughtRow>(
     `INSERT INTO thoughts (content, embedding, metadata, project, supersedes, created_by, ${TAGLINE_COLS})
@@ -600,7 +607,7 @@ export async function updateThought(
   // OLD value -- two truths for one fact, which is precisely what [HOFFA]'s
   // "one truth, one display" ruling (S278) forbids. A flip that edits only the
   // string is the same defect wearing different clothes.
-  const tags = await taglineValues(pool, content, id);
+  const tags = await taglineValues(pool, content, merged, id);
 
   const { rows, rowCount } = await pool.query<ThoughtRow>(
     `UPDATE thoughts
@@ -721,7 +728,7 @@ export async function batchInsertThoughts(
     for (const thought of thoughts) {
       const embeddingStr = `[${thought.embedding.join(",")}]`;
 
-      const tags = await taglineValues(client, thought.content);
+      const tags = await taglineValues(client, thought.content, thought.metadata);
 
       const { rows } = await client.query<ThoughtRow>(
         `INSERT INTO thoughts (content, embedding, metadata, project, created_by, ${TAGLINE_COLS})
@@ -788,7 +795,7 @@ export async function captureThought(
       return { row: existing, deduplicated: true };
     }
 
-    const tags = await taglineValues(client, content);
+    const tags = await taglineValues(client, content, metadata);
 
     const { rows } = await client.query<ThoughtRow>(
       `INSERT INTO thoughts (content, embedding, metadata, project, supersedes, created_by, idempotency_key, ${TAGLINE_COLS})
@@ -854,7 +861,7 @@ export async function captureThoughts(
         continue;
       }
 
-      const tags = await taglineValues(client, t.content);
+      const tags = await taglineValues(client, t.content, t.metadata);
 
       const { rows } = await client.query<ThoughtRow>(
         `INSERT INTO thoughts (content, embedding, metadata, project, created_by, ${TAGLINE_COLS})

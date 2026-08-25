@@ -3,21 +3,58 @@
  * onto the `class` / `lesson` / `session` / `incorporated_into` / `duplicate_of`
  * columns added by migration 006.
  *
- * *** THIS MUST STAY SEMANTICALLY IDENTICAL TO THE S278 M1 BACKFILL. *** The
- * backfill parsed 1,001 historical rows into these columns; if the runtime
- * parser disagrees, the corpus silently splits into "rows written before E2" and
- * "rows written after", which is exactly the divergence the columns exist to end.
- * The M1 census is pinned in the unit tests as fixtures.
+ * *** THE "SEMANTICALLY IDENTICAL TO THE M1 BACKFILL" CLAIM IS RETIRED (S281). ***
+ * It was never wholly true and it is now deliberately false for `session`.
  *
- * SCOPE IS LINE 1 ONLY, and that is a deliberate difference from the backfill.
- * The backfill also looked at lines 2-6, because 32 historical rows carry their
- * tag line further down and it was repairing them. At WRITE time that leniency
- * would be harmful: both tag-line readers (`build-reflection-classes.mjs` and
- * `tags_contain`) are bound to `split_part(content, E'\n', 1)`, so accepting a
- * tag on line 3 would populate columns for a row those readers can never see --
- * manufacturing new instances of the very defect the backfill just repaired.
- * Line 1 or nothing makes the miner's hard constraint enforceable instead of
- * aspirational.
+ * What it got right: `class`, `lesson`, `incorporated_into` and `duplicate_of`
+ * are still parsed exactly as the backfill parsed them, and the M1 census is
+ * still pinned in the unit tests as fixtures. `parseTagLine` below is unchanged.
+ *
+ * What it always omitted: the backfill enforces `SESSION_MAX = 300` and this
+ * parser deliberately refuses any upper bound (see RX_SESSION_* below -- a
+ * constant like `n <= 300` is a silent expiry date). Two parsers, two upper
+ * bounds, one claiming identity, for three sessions.
+ *
+ * What [HOFFA] changed at S281: `session` MEANS THE CAPTURE SESSION and is
+ * DERIVED FROM `metadata.source`. The backfill's session values were scraped
+ * from PROSE -- for a row whose line 1 is not a tag line it widened scope to
+ * `lines[:6]` and ran a bare S-number regex over the headline, so it routinely
+ * read a REFERENCED session ("Extends /S168", "Instances: S151") as the capture
+ * session. Measured across the live corpus: 89 of 711 comparable rows (12.5%)
+ * disagree with `metadata.source`. See `claude-workshop Tools/ob1-provenance/`.
+ *
+ * SESSION RESOLUTION IS FOUR TIERS (`resolveSession` below), and the ORDER is
+ * the whole ruling:
+ *   1. `metadata.source`   -- written by the capture; the only field that
+ *                             actually means "when was this written".
+ *   2. explicit `session:` / `datapoint:S` token on line 1  -- a FALLBACK, not
+ *                             an override. It outranking source is what let an
+ *                             INCORPORATION walk stamp its own number onto a
+ *                             thought captured 107 sessions earlier (2bb380da:
+ *                             created at S159, source S159, prose opens
+ *                             "S159 --", tag line says `session:S266`). Source
+ *                             winning makes flip-stamping STRUCTURALLY
+ *                             impossible rather than a matter of authoring care.
+ *   3. bare `S###` on line 1  -- RETAINED, against the letter of the ruling,
+ *                             because measurement showed the ruling's target was
+ *                             the BACKFILL's prose scraping, which has no runtime
+ *                             equivalent. This tier only reads line 1, and can
+ *                             now only fire when tiers 1 and 2 are both silent.
+ *                             Deleting it would NULL 11 rows whose source is the
+ *                             literal string "mcp" and whose tag line carries the
+ *                             only correct session that exists for them.
+ *   4. NULL -- the honest value for "not stated".
+ *
+ * SCOPE IS LINE 1 ONLY for every tag-line tier, and that is a deliberate
+ * difference from the backfill. The backfill also looked at lines 2-6, because
+ * 32 historical rows carried their tag line further down and it was repairing
+ * them. (Those rows were repaired in the data at S281; 30 moved, 2 were prose
+ * that merely CONTAINED `class:`.) At WRITE time that leniency would be harmful:
+ * both tag-line readers were bound to `split_part(content, E'\n', 1)` when this
+ * was written, so accepting a tag on line 3 would populate columns for a row
+ * those readers could never see -- manufacturing new instances of the very
+ * defect the backfill just repaired. Line 1 or nothing makes the miner's hard
+ * constraint enforceable instead of aspirational.
  */
 
 /** The six ruled dispositions ([HOFFA], S278). NOT five, and NOT seven. */
@@ -153,4 +190,91 @@ export function parseTagLine(content: string): TagLineColumns {
   }
 
   return out;
+}
+
+// ─── Session resolution (S281) ───────────────────────────────────────
+
+/**
+ * `metadata.source` shapes live in the corpus, and the `s` is CASE-INSENSITIVE
+ * on purpose: `cowork-s125`, `clawdferret-s130` and `duke-sched-probe-s111` are
+ * as much a session reference as `clawdferret-S131`. A case-SENSITIVE match
+ * loses 27 rows across 11 distinct sources for no reason anyone chose.
+ *
+ * Measured against the full source vocabulary before widening: the sources this
+ * still refuses (`mcp`, `research-pointer-*`, `scheduled-task:*`,
+ * `duke-finance-specialist-v1-firstfire`) genuinely name no session. Zero false
+ * positives -- which is a fact about today's vocabulary, so re-measure before
+ * widening it again rather than assuming it stays true.
+ */
+const RX_SOURCE_KW = /session-(\d{1,4})/i;
+const RX_SOURCE_BARE = /(?<![A-Za-z0-9])s(\d{1,4})(?![0-9])/i;
+
+/** Capture session from a free-text `metadata.source`. NULL = not stated. */
+export function parseSourceSession(source?: string | null): number | null {
+  if (!source) return null;
+  for (const rx of [RX_SOURCE_KW, RX_SOURCE_BARE]) {
+    const m = rx.exec(source);
+    if (m) {
+      const n = Number(m[1]);
+      // Same lower bound and same refusal of an upper bound as parseTagLine.
+      if (n >= 1) return n;
+    }
+  }
+  return null;
+}
+
+/**
+ * Tiers 2 and 3 kept apart, because their PRECEDENCE relative to source is the
+ * same but their standing against each other is not: an explicit `session:` is
+ * a declaration, a bare `S###` is an observation about the line's text.
+ */
+export function taglineSessionTiers(content: string): {
+  explicit: number | null;
+  bare: number | null;
+} {
+  const line1 = (content ?? "").split("\n", 1)[0] ?? "";
+  if (!isTagLine(line1)) return { explicit: null, bare: null };
+
+  let explicit: number | null = null;
+  for (const rx of [RX_SESSION_KW, RX_SESSION_DP]) {
+    const m = rx.exec(line1);
+    if (m) {
+      const n = Number(m[1]);
+      if (n >= 1) explicit = n;
+      break;
+    }
+  }
+
+  let bare: number | null = null;
+  const mb = RX_SESSION_BARE.exec(line1);
+  if (mb) {
+    const n = Number(mb[1]);
+    if (n >= 1) bare = n;
+  }
+
+  return { explicit, bare };
+}
+
+/**
+ * THE RULED PRECEDENCE (S281): source, then an explicit token, then a bare
+ * S-number on line 1, then NULL.
+ *
+ * *** THE TAG-LINE TOKEN IS A FALLBACK, NOT AN OVERRIDE. *** That inversion is
+ * the entire point: while the token outranked source, an incorporation walk
+ * that wrote `session:S266` into a tag line silently re-dated a thought captured
+ * at S159, and no amount of authoring guidance could prevent the next one.
+ * Source winning makes it impossible instead of discouraged.
+ *
+ * Consequence accepted with the ruling: an author can no longer correct a
+ * wrong-but-parseable source by editing the tag line. The correction has to go
+ * to `metadata.source`, which is the field that actually claims to know.
+ */
+export function resolveSession(
+  source: string | null | undefined,
+  content: string
+): number | null {
+  const fromSource = parseSourceSession(source);
+  if (fromSource !== null) return fromSource;
+  const t = taglineSessionTiers(content);
+  return t.explicit ?? t.bare;
 }
