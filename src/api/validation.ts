@@ -16,7 +16,8 @@ export interface CaptureWarning {
     | "unknown_field"
     | "deprecated_top_level"
     | "wrong_type"
-    | "embedding_truncated";
+    | "embedding_truncated"
+    | "default_source_used";
   message: string;
   suggestion?: string;
 }
@@ -87,6 +88,18 @@ const PROMOTABLE_TO_METADATA = new Set([
 export interface ValidationOptions {
   /** Default value for `source` if the caller omits it. */
   defaultSource: string;
+  /**
+   * Set by `validateBatchInput` when NEITHER the batch envelope NOR the item
+   * supplied a `source`, so the item is running on `defaultSource`.
+   *
+   * *** THIS EXISTS BECAUSE THE BATCH PATH CANNOT BE DETECTED FROM INSIDE. ***
+   * `validateBatchInput` always writes a resolved `source` into the object it
+   * hands down, so `body.source === undefined` is ALWAYS false for a batch
+   * item. Without this flag the default-source warning below would fire only
+   * on single captures and stay silent on `capture_thoughts` -- i.e. silent on
+   * exactly the bulk path a close-out uses, while looking fixed.
+   */
+  sourceWasDefaulted?: boolean;
   /**
    * If true, `unknown_field` / `deprecated_top_level` / `wrong_type` warnings
    * become hard CaptureValidationError throws (= HTTP 400 / MCP isError) so
@@ -175,6 +188,33 @@ export function validateCaptureInput(
         : (() => {
             throw new CaptureValidationError("source must be a non-empty string when provided");
           })();
+
+  // *** PROVENANCE IS LOST SILENTLY WITHOUT THIS. ***
+  // `defaultSource` is a TRANSPORT name ("mcp", "api"), never a provenance
+  // value. A row that takes it cannot be attributed to a session by any
+  // counterparty, and the capture otherwise succeeds and looks entirely
+  // normal -- so nothing tells the caller until a census counts the damage
+  // sessions later. Measured S291: 44 of 50 permanently unadjudicable rows in
+  // the corpus took this default, arriving in per-session batches because a
+  // session that omits `source` omits it on EVERY capture it makes.
+  //
+  // Informational only, and NOT escalated in strict mode -- deliberately, for
+  // the reason `embedding_truncated` is not either. `source` is an OPTIONAL
+  // field with a documented default; escalating would silently redefine it as
+  // MANDATORY whenever strict ingest is on, which is an API contract change,
+  // not a warning. The warning surfaces in the capture response, which is the
+  // surface the omitting caller actually reads.
+  if (body.source === undefined || opts.sourceWasDefaulted === true) {
+    warnings.push({
+      field: "source",
+      reason: "default_source_used",
+      message:
+        `'source' was not supplied, so it defaulted to '${opts.defaultSource}' — ` +
+        `a transport name, not a provenance value. This row cannot be attributed ` +
+        `to a session and is permanently unadjudicable.`,
+      suggestion: `Pass 'source' explicitly, e.g. 'session-<N>-clawdferret'.`,
+    });
+  }
 
   const project = strictOptionalString(body, "project");
   const created_by = strictOptionalString(body, "created_by");
@@ -307,12 +347,11 @@ export function validateBatchInput(
 
   const inheritedProject = strictOptionalString(body, "project");
   const inheritedCreatedBy = strictOptionalString(body, "created_by");
-  const inheritedSource =
-    body.source === undefined
-      ? opts.defaultSource
-      : typeof body.source === "string" && body.source.length > 0
-        ? body.source
-        : opts.defaultSource;
+  const envelopeSuppliedSource =
+    typeof body.source === "string" && body.source.length > 0;
+  const inheritedSource = envelopeSuppliedSource
+    ? (body.source as string)
+    : opts.defaultSource;
   const inheritedMetadata =
     body.metadata && typeof body.metadata === "object" && !Array.isArray(body.metadata)
       ? (body.metadata as Record<string, unknown>)
@@ -330,7 +369,16 @@ export function validateBatchInput(
       metadata: { ...inheritedMetadata },
       ...(t as Record<string, unknown>),
     };
-    return validateCaptureInput(merged, { defaultSource: inheritedSource, strict });
+    // An item may supply its own `source` and override a defaulted envelope,
+    // so the question is per-item: did EITHER level state one?
+    const itemSuppliedSource =
+      typeof (t as Record<string, unknown>).source === "string" &&
+      ((t as Record<string, unknown>).source as string).trim().length > 0;
+    return validateCaptureInput(merged, {
+      defaultSource: inheritedSource,
+      strict,
+      sourceWasDefaulted: !envelopeSuppliedSource && !itemSuppliedSource,
+    });
   });
 
   return { items, warnings: envelopeWarnings };
