@@ -13,6 +13,7 @@ import {
   captureThought,
   searchThoughts,
   listThoughts,
+  countThoughts,
   getThoughtById,
   getThoughtStats,
   updateThought,
@@ -32,7 +33,10 @@ import {
   isStrictIngestEnabled,
 } from "./validation.js";
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** Upper bound on one /memories/list page. `total` is always returned, so a caller can page past it. */
+const LIST_MAX_LIMIT = 1000;
+
+const UUID_RE =/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function createApi(): Hono {
   const app = new Hono();
@@ -331,13 +335,32 @@ export function createApi(): Hono {
 
   // ─── List Memories ───────────────────────────────────────────────
 
+  // `limit` and `offset` used to be accepted in the body and silently dropped: the
+  // filters went through, the page size did not, so every call returned the default 50
+  // with `count: 50` reading like a total. A consumer asking for 200 rows of a 352-row
+  // class got 50 and believed it. The MCP list_thoughts tool paged correctly the whole
+  // time -- only this route was missed. Now mirrors it, and returns `total` so a caller
+  // can tell a full page from a complete answer.
   app.post("/memories/list", async (c) => {
     try {
-      const body = await c.req.json<ListFilters>();
-      const results = await listThoughts(pool, body);
+      const body = await c.req.json<ListFilters & { limit?: unknown; offset?: unknown }>();
+      const { limit: rawLimit, offset: rawOffset, ...filters } = body;
+      const limit = Math.min(
+        LIST_MAX_LIMIT,
+        Math.max(1, Number.isInteger(rawLimit) ? (rawLimit as number) : 50)
+      );
+      const offset = Math.max(0, Number.isInteger(rawOffset) ? (rawOffset as number) : 0);
+
+      const [results, total] = await Promise.all([
+        listThoughts(pool, filters, limit, offset),
+        countThoughts(pool, filters),
+      ]);
 
       return c.json({
         count: results.length,
+        total,
+        limit,
+        offset,
         results: results.map((r) => ({
           id: r.id,
           content: r.content,

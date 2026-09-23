@@ -41,8 +41,10 @@ const mockGetThoughtStats = vi.fn();
 const mockUpdateThought = vi.fn();
 const mockDeleteThought = vi.fn();
 const mockCaptureThoughts = vi.fn();
+const mockCountThoughts = vi.fn();
 
 vi.mock("../../db/queries.js", () => ({
+  countThoughts: (...args: any[]) => mockCountThoughts(...args),
   captureThought: (...args: any[]) => mockCaptureThought(...args),
   searchThoughts: (...args: any[]) => mockSearchThoughts(...args),
   listThoughts: (...args: any[]) => mockListThoughts(...args),
@@ -68,6 +70,63 @@ describe("REST API Routes", () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { status: string };
     expect(body.status).toBe("healthy");
+  });
+
+  // ─── POST /memories/list ───────────────────────────────────────────
+  // limit/offset were accepted and silently dropped, so every call returned the
+  // default page of 50. These pin that they now reach the query, and that `total`
+  // lets a caller tell a full page from a complete answer.
+
+  const listRequest = (body: unknown) =>
+    app.request("/memories/list", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+  it("POST /memories/list passes limit and offset through to the query", async () => {
+    mockListThoughts.mockResolvedValueOnce([]);
+    mockCountThoughts.mockResolvedValueOnce(352);
+
+    const res = await listRequest({ tags_contain: "class:x", limit: 200, offset: 50 });
+    expect(res.status).toBe(200);
+
+    const [, filters, limit, offset] = mockListThoughts.mock.calls[0]!;
+    expect(limit).toBe(200);
+    expect(offset).toBe(50);
+    // paging params are NOT filters
+    expect(filters).toEqual({ tags_contain: "class:x" });
+    expect(mockCountThoughts.mock.calls[0]![1]).toEqual({ tags_contain: "class:x" });
+  });
+
+  it("POST /memories/list returns total, limit and offset beside count", async () => {
+    mockListThoughts.mockResolvedValueOnce([
+      { id: "a", content: "x", metadata: {}, created_at: new Date() },
+    ]);
+    mockCountThoughts.mockResolvedValueOnce(352);
+
+    const body = (await (await listRequest({ limit: 1 })).json()) as Record<string, unknown>;
+    expect(body.count).toBe(1);
+    expect(body.total).toBe(352);
+    expect(body.limit).toBe(1);
+    expect(body.offset).toBe(0);
+  });
+
+  it("POST /memories/list defaults to 50/0 and clamps bad or oversized values", async () => {
+    mockListThoughts.mockResolvedValue([]);
+    mockCountThoughts.mockResolvedValue(0);
+
+    await listRequest({});
+    expect(mockListThoughts.mock.calls[0]!.slice(2)).toEqual([50, 0]);
+
+    await listRequest({ limit: "200", offset: -5 });
+    expect(mockListThoughts.mock.calls[1]!.slice(2)).toEqual([50, 0]);
+
+    await listRequest({ limit: 0 });
+    expect(mockListThoughts.mock.calls[2]![2]).toBe(1);
+
+    await listRequest({ limit: 1_000_000 });
+    expect(mockListThoughts.mock.calls[3]![2]).toBe(1000);
   });
 
   // ─── POST /memories ────────────────────────────────────────────────
