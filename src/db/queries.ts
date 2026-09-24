@@ -3,7 +3,11 @@
  * All queries use parameterized SQL (no interpolation).
  */
 
+import { createHash } from "node:crypto";
+
 import type pg from "pg";
+
+import { parseTagLine, resolveSession, type LessonValue } from "./tagline.js";
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -30,6 +34,12 @@ export interface ThoughtRow {
   archived?: boolean;
   supersedes?: string | null;
   created_at: Date;
+  // ─ tag-line columns (migration 006, dual-written since E2/S278) ─
+  class?: string | null;
+  lesson?: LessonValue | null;
+  session?: number | null;
+  incorporated_into?: string | null;
+  duplicate_of?: string | null;
 }
 
 export interface SearchResult extends ThoughtRow {
@@ -52,10 +62,175 @@ export interface ListFilters {
   project?: string;
   created_by?: string;
   include_archived?: boolean;
+  /** Case-insensitive substring match against the first line of content (the tags: line). */
+  tags_contain?: string;
 }
+
+// --- Capture idempotency -------------------------------------------
+
+/**
+ * A client timeout on capture does NOT cancel the server write: the row commits, the
+ * client sees a transport error, and a retry writes a SECOND copy. Measured on the live
+ * corpus at S275 -- all five uncontaminated exact-duplicate groups were pairs written
+ * 39-98 SECONDS apart, byte-identical, three of them sharing one first-write timestamp
+ * (a batch retried wholesale).
+ *
+ * The window is what separates a RETRY from a DELIBERATE re-capture. It is policy, not
+ * an invariant, so it lives here and NOT as a unique constraint on content_hash --
+ * permanent uniqueness would forbid ever legitimately re-capturing the same text.
+ *
+ * 10 minutes against an observed worst case of 98 seconds: ~6x headroom, while still far
+ * below any plausible interval at which a human deliberately re-captures identical text.
+ * Widening this trades duplicate-suppression for silently swallowing real writes.
+ */
+export const DEDUP_WINDOW_MINUTES = 10;
+
+export interface CaptureOptions {
+  /** Overrides DEDUP_WINDOW_MINUTES. 0 disables content-hash dedup entirely. */
+  dedupWindowMinutes?: number;
+  /**
+   * Optional client-supplied key. Exact semantics, independent of the window -- but it
+   * only helps a client that can REUSE the key across a retry, which is precisely what a
+   * timed-out agent cannot be relied upon to do. The content hash is the load-bearing
+   * mechanism; this is the belt to its braces.
+   */
+  idempotencyKey?: string;
+}
+
+export interface CaptureResult {
+  row: ThoughtRow;
+  /** True when an existing row was returned instead of inserting a new one. */
+  deduplicated: boolean;
+}
+
+/** sha256 hex of content. Verified byte-identical to the DB's generated column. */
+export function contentHash(content: string): string {
+  return createHash("sha256").update(content, "utf8").digest("hex");
+}
+
+const RETURNING_COLS =
+  "id, content, metadata, project, created_by, archived, supersedes, created_at, " +
+  "class, lesson, session, incorporated_into, duplicate_of";
+
+/**
+ * The tag-line columns, written by every insert path. Declared ONCE so the four
+ * INSERTs cannot drift apart; `tagline-coverage.test.ts` asserts at the source
+ * level that no `INSERT INTO thoughts` omits them, so a fifth write path added
+ * later fails the suite instead of silently writing NULLs.
+ */
+const TAGLINE_COLS = "class, lesson, session, incorporated_into, duplicate_of";
+
+/**
+ * Resolve a tag-line `duplicate-of:` reference (an 8-char id prefix) to a full
+ * uuid. Returns null unless it matches EXACTLY ONE row.
+ *
+ * Ambiguity is refused rather than guessed: 8 hex chars is a 4.3e9 space, which
+ * is collision-free across the 1,001 rows measured at S278 (~0.01%) but reaches
+ * ~1.2% at 10k. When it eventually collides, this returns null and the reference
+ * stays visible in the tag line -- a missing edge, never a WRONG one pointing at
+ * an unrelated thought.
+ */
+async function resolveDuplicateRef(
+  q: Pick<pg.Pool, "query"> | pg.PoolClient,
+  ref: string | null,
+  excludeId?: string
+): Promise<string | null> {
+  if (!ref) return null;
+  const { rows } = await q.query<{ id: string }>(
+    `SELECT id::text AS id FROM thoughts WHERE id::text LIKE $1 LIMIT 2`,
+    [`${ref}%`]
+  );
+  if (rows.length !== 1) return null;
+  // A thought cannot be a duplicate of itself. The FK would happily accept it
+  // and the row would then inflate the duplicate-rate signal S181 keeps
+  // duplicates around to measure -- a self-edge is worse than a missing one.
+  if (excludeId && rows[0]!.id === excludeId) return null;
+  return rows[0]!.id;
+}
+
+/** Parse + resolve in one step: the tuple every write path binds. */
+async function taglineValues(
+  q: Pick<pg.Pool, "query"> | pg.PoolClient,
+  content: string,
+  metadata: ThoughtMetadata | null | undefined,
+  excludeId?: string
+): Promise<[string | null, LessonValue | null, number | null, string | null, string | null]> {
+  const t = parseTagLine(content);
+  return [
+    t.class,
+    t.lesson,
+    // *** NOT `t.session`. *** [HOFFA] ruled at S281 that `session` MEANS the
+    // capture session and is DERIVED from `metadata.source`, with the tag-line
+    // token demoted to a FALLBACK. `parseTagLine` stays pure over content (its
+    // M1 fixtures still pin it), so the tier logic composes here -- this is the
+    // one seam every write path already binds, which is why it is the one place
+    // the precedence needs to exist.
+    resolveSession(metadata?.source, content),
+    t.incorporated_into,
+    await resolveDuplicateRef(q, t.duplicate_of_ref, excludeId),
+  ];
+}
+
+/**
+ * Look for an existing row this capture would duplicate.
+ *
+ * Scope is (content_hash, project, created_by) within the window. `source` is
+ * deliberately NOT part of the identity -- a retry carries the same source anyway, and
+ * two sources capturing byte-identical text inside ten minutes is a duplicate worth
+ * collapsing regardless.
+ *
+ * IS NOT DISTINCT FROM, never `=`: project and created_by are nullable and `NULL = NULL`
+ * is NULL, so `=` would silently never match the very common unscoped rows -- a dedup
+ * that quietly does nothing for most captures.
+ */
+async function findDuplicate(
+  client: pg.PoolClient,
+  hash: string,
+  project: string | null,
+  created_by: string | null,
+  windowMinutes: number,
+  idempotencyKey?: string
+): Promise<ThoughtRow | null> {
+  if (idempotencyKey) {
+    const { rows } = await client.query<ThoughtRow>(
+      `SELECT ${RETURNING_COLS} FROM thoughts WHERE idempotency_key = $1 LIMIT 1`,
+      [idempotencyKey]
+    );
+    if (rows[0]) return rows[0];
+  }
+
+  if (windowMinutes <= 0) return null;
+
+  const { rows } = await client.query<ThoughtRow>(
+    `SELECT ${RETURNING_COLS}
+       FROM thoughts
+      WHERE content_hash = $1
+        AND project    IS NOT DISTINCT FROM $2
+        AND created_by IS NOT DISTINCT FROM $3
+        AND created_at > now() - ($4 || ' minutes')::interval
+      ORDER BY created_at ASC
+      LIMIT 1`,
+    [hash, project, created_by, String(windowMinutes)]
+  );
+  return rows[0] ?? null;
+}
+
+/**
+ * Serialise concurrent captures of identical content so check-then-insert cannot
+ * interleave. Transaction-scoped: released on COMMIT/ROLLBACK, so there is no leak path.
+ */
+async function lockOnHash(client: pg.PoolClient, hash: string): Promise<void> {
+  await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [hash]);
+}
+
 
 // ─── Insert ──────────────────────────────────────────────────────────
 
+/**
+ * RAW insert -- NO dedup, NO transaction. Prefer captureThought() for anything reached by
+ * a network client: this path cannot tell a retry from a new thought. Kept exported
+ * because it is the honest primitive and the unit tests exercise it directly.
+ */
 export async function insertThought(
   pool: pg.Pool,
   content: string,
@@ -66,12 +241,13 @@ export async function insertThought(
   created_by?: string
 ): Promise<ThoughtRow> {
   const embeddingStr = `[${embedding.join(",")}]`;
+  const tags = await taglineValues(pool, content, metadata);
 
   const { rows } = await pool.query<ThoughtRow>(
-    `INSERT INTO thoughts (content, embedding, metadata, project, supersedes, created_by)
-     VALUES ($1, $2::vector, $3::jsonb, $4, $5, $6)
-     RETURNING id, content, metadata, project, created_by, archived, supersedes, created_at`,
-    [content, embeddingStr, JSON.stringify(metadata), project ?? null, supersedes ?? null, created_by ?? null]
+    `INSERT INTO thoughts (content, embedding, metadata, project, supersedes, created_by, ${TAGLINE_COLS})
+     VALUES ($1, $2::vector, $3::jsonb, $4, $5, $6, $7, $8, $9, $10, $11)
+     RETURNING ${RETURNING_COLS}`,
+    [content, embeddingStr, JSON.stringify(metadata), project ?? null, supersedes ?? null, created_by ?? null, ...tags]
   );
 
   return rows[0]!;
@@ -110,11 +286,12 @@ export async function searchThoughts(
 
 // ─── Filtered List ───────────────────────────────────────────────────
 
-export async function listThoughts(
-  pool: pg.Pool,
-  filters: ListFilters,
-  limit: number = 50
-): Promise<ThoughtRow[]> {
+/** Build the WHERE clause + params shared by listThoughts and countThoughts. */
+function buildListConditions(filters: ListFilters): {
+  whereClause: string;
+  params: unknown[];
+  idx: number;
+} {
   const conditions: string[] = [];
   const params: unknown[] = [];
   let idx = 0;
@@ -157,25 +334,112 @@ export async function listThoughts(
     params.push(filters.created_by);
   }
 
+  if (filters.tags_contain) {
+    idx++;
+    // M3 (S280) — READ THE COLUMNS, not only the string.
+    //
+    // Still scoped to line 1 / the columns rather than the whole body, so prose
+    // mentions of a tag elsewhere don't false-positive. What changed is that the
+    // PROMOTED tokens are now matched against migration 006's columns as well.
+    //
+    // *** THIS IS DELIBERATELY AN `OR`, AND THE OR IS THE WHOLE DESIGN. ***
+    // Only five tokens were promoted to columns; `topic:`, `role:`, `dp:` and
+    // friends still live nowhere but the line. A column-ONLY predicate would
+    // therefore have silently broken every filter on an unpromoted token --
+    // trading one blind spot for another and calling it a migration. The union
+    // is a strict SUPERSET of the old behaviour: nothing that matched before
+    // stops matching, and rows whose tag line is not on line 1 become reachable
+    // for the first time.
+    //
+    // MEASURED BEFORE CHANGING ANYTHING (S280, live corpus, the direction an
+    // aggregate cannot show you -- see instrument-honesty.md §Sabotage-proving
+    // obligation (2) rider):
+    //     line=t, col=t  ->  434     line=f, col=t  ->  25   (gained)
+    //     line=f, col=f  ->  553     line=t, col=f  ->   0   (LOST -- none)
+    // The empty `line=t, col=f` cell is the gate. Had it been non-zero this
+    // change would have LOST rows while appearing to add 25.
+    //
+    // The projection below is hand-rolled rather than shared with a renderer
+    // because C1 (the tag line as a rendered projection of the columns) is not
+    // built yet. WHEN C1 LANDS, THIS MUST SWITCH TO THAT RENDERER -- two
+    // independent spellings of one projection is the second-truth defect the
+    // column promotion exists to end. concat_ws skips NULLs, and `||` against a
+    // NULL column yields NULL, so an unset column contributes nothing.
+    conditions.push(
+      `(split_part(content, E'\\n', 1) ILIKE $${idx}` +
+        ` OR concat_ws(' ',` +
+        ` 'class:' || class,` +
+        ` 'lesson:' || lesson,` +
+        ` 'session:S' || session,` +
+        ` 'incorporated_into:' || incorporated_into,` +
+        ` 'duplicate-of:' || duplicate_of` +
+        `) ILIKE $${idx})`,
+    );
+    params.push(`%${filters.tags_contain}%`);
+  }
+
   if (!filters.include_archived) {
     conditions.push(`(archived = false OR archived IS NULL)`);
   }
 
-  idx++;
-  params.push(limit);
-
   const whereClause = conditions.length > 0 ? conditions.join(" AND ") : "TRUE";
+  return { whereClause, params, idx };
+}
+
+export async function listThoughts(
+  pool: pg.Pool,
+  filters: ListFilters,
+  limit: number = 50,
+  offset: number = 0
+): Promise<ThoughtRow[]> {
+  const { whereClause, params, idx } = buildListConditions(filters);
+
+  const limitIdx = idx + 1;
+  const offsetIdx = idx + 2;
+  params.push(limit, offset);
 
   const { rows } = await pool.query<ThoughtRow>(
     `SELECT id, content, metadata, created_by, created_at
      FROM thoughts
      WHERE ${whereClause}
      ORDER BY created_at DESC
-     LIMIT $${idx}`,
+     LIMIT $${limitIdx}
+     OFFSET $${offsetIdx}`,
     params
   );
 
   return rows;
+}
+
+/** Count thoughts matching the same filters as listThoughts (for pagination totals). */
+export async function countThoughts(
+  pool: pg.Pool,
+  filters: ListFilters
+): Promise<number> {
+  const { whereClause, params } = buildListConditions(filters);
+
+  const { rows } = await pool.query<{ count: string }>(
+    `SELECT COUNT(*) AS count FROM thoughts WHERE ${whereClause}`,
+    params
+  );
+
+  return parseInt(rows[0]?.count ?? "0", 10);
+}
+
+// ─── Get by ID ───────────────────────────────────────────────────────
+
+export async function getThoughtById(
+  pool: pg.Pool,
+  id: string
+): Promise<ThoughtRow | null> {
+  const { rows } = await pool.query<ThoughtRow>(
+    `SELECT id, content, metadata, project, created_by, archived, supersedes, created_at
+     FROM thoughts
+     WHERE id = $1`,
+    [id]
+  );
+
+  return rows[0] ?? null;
 }
 
 // ─── Statistics ──────────────────────────────────────────────────────
@@ -287,6 +551,35 @@ export async function getThoughtStats(
 
 // ─── Update ──────────────────────────────────────────────────────────
 
+/**
+ * Provenance-class metadata keys must survive updates. The update pipeline
+ * re-extracts metadata from content, which can never reproduce `source` or
+ * `provenance` — they describe where the thought CAME FROM, not what it says.
+ * Losing them breaks import-dedup identity (searchThoughtsBySource matches on
+ * metadata.source / provenance.origin) and nulls the generated columns
+ * source_file_hash / code_hash (derived from provenance.contentHash), which
+ * re-opens the duplicate-import window those hashes exist to close.
+ *
+ * Merge rule: keys carried over from the existing row unless the caller
+ * explicitly supplies a replacement value. Explicit app-code merge (not SQL
+ * `||`) so the preserved key set is visible and reviewable here.
+ */
+const PRESERVED_METADATA_KEYS = ["source", "provenance"] as const;
+
+export function mergePreservedMetadata(
+  existing: ThoughtMetadata | null | undefined,
+  incoming: ThoughtMetadata
+): ThoughtMetadata {
+  const merged: ThoughtMetadata = { ...incoming };
+  if (!existing) return merged;
+  for (const key of PRESERVED_METADATA_KEYS) {
+    if (merged[key] === undefined && existing[key] !== undefined) {
+      merged[key] = existing[key] as never;
+    }
+  }
+  return merged;
+}
+
 export async function updateThought(
   pool: pg.Pool,
   id: string,
@@ -296,12 +589,33 @@ export async function updateThought(
 ): Promise<ThoughtRow> {
   const embeddingStr = `[${embedding.join(",")}]`;
 
+  const existing = await pool.query<{ metadata: ThoughtMetadata | null }>(
+    `SELECT metadata FROM thoughts WHERE id = $1`,
+    [id]
+  );
+
+  if (!existing.rowCount || existing.rowCount === 0) {
+    throw new Error(`Thought not found: ${id}`);
+  }
+
+  const merged = mergePreservedMetadata(existing.rows[0]!.metadata, metadata);
+
+  // *** RE-PARSE ON EVERY UPDATE. *** This is the path `process-reflection-queue`
+  // §Tag-flip reaches (PUT /memories/:id in tags_line splice mode) to move a
+  // thought from `lesson:open` to a disposition. If the columns were not
+  // recomputed here, a flip would change the tag line while the column kept the
+  // OLD value -- two truths for one fact, which is precisely what [HOFFA]'s
+  // "one truth, one display" ruling (S278) forbids. A flip that edits only the
+  // string is the same defect wearing different clothes.
+  const tags = await taglineValues(pool, content, merged, id);
+
   const { rows, rowCount } = await pool.query<ThoughtRow>(
     `UPDATE thoughts
-     SET content = $2, embedding = $3::vector, metadata = $4::jsonb
+     SET content = $2, embedding = $3::vector, metadata = $4::jsonb,
+         class = $5, lesson = $6, session = $7, incorporated_into = $8, duplicate_of = $9
      WHERE id = $1
-     RETURNING id, content, metadata, project, archived, supersedes, created_at`,
-    [id, content, embeddingStr, JSON.stringify(metadata)]
+     RETURNING ${RETURNING_COLS}`,
+    [id, content, embeddingStr, JSON.stringify(merged), ...tags]
   );
 
   if (!rowCount || rowCount === 0) {
@@ -398,6 +712,9 @@ export interface BatchThoughtInput {
   created_by?: string;
 }
 
+/**
+ * RAW batch insert -- NO dedup. Prefer captureThoughts(). See insertThought's note.
+ */
 export async function batchInsertThoughts(
   pool: pg.Pool,
   thoughts: BatchThoughtInput[]
@@ -411,16 +728,19 @@ export async function batchInsertThoughts(
     for (const thought of thoughts) {
       const embeddingStr = `[${thought.embedding.join(",")}]`;
 
+      const tags = await taglineValues(client, thought.content, thought.metadata);
+
       const { rows } = await client.query<ThoughtRow>(
-        `INSERT INTO thoughts (content, embedding, metadata, project, created_by)
-         VALUES ($1, $2::vector, $3::jsonb, $4, $5)
-         RETURNING id, content, metadata, project, created_by, archived, supersedes, created_at`,
+        `INSERT INTO thoughts (content, embedding, metadata, project, created_by, ${TAGLINE_COLS})
+         VALUES ($1, $2::vector, $3::jsonb, $4, $5, $6, $7, $8, $9, $10)
+         RETURNING ${RETURNING_COLS}`,
         [
           thought.content,
           embeddingStr,
           JSON.stringify(thought.metadata),
           thought.project ?? null,
           thought.created_by ?? null,
+          ...tags,
         ]
       );
 
@@ -436,4 +756,128 @@ export async function batchInsertThoughts(
   }
 
   return results;
+}
+
+
+// --- Deduplicating capture (the front door) ------------------------
+
+/**
+ * Capture a thought, collapsing a retry of a recent identical capture onto the row it
+ * would have duplicated.
+ *
+ * Returns the EXISTING row with deduplicated:true rather than erroring, so a client is
+ * free to retry any timeout safely -- which is the whole point. Refusing the write would
+ * have preserved the duplicate-avoidance while destroying the retry-safety it exists for.
+ */
+export async function captureThought(
+  pool: pg.Pool,
+  content: string,
+  embedding: number[],
+  metadata: ThoughtMetadata,
+  project?: string,
+  supersedes?: string,
+  created_by?: string,
+  options: CaptureOptions = {}
+): Promise<CaptureResult> {
+  const hash = contentHash(content);
+  const windowMinutes = options.dedupWindowMinutes ?? DEDUP_WINDOW_MINUTES;
+  const proj = project ?? null;
+  const by = created_by ?? null;
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await lockOnHash(client, hash);
+
+    const existing = await findDuplicate(client, hash, proj, by, windowMinutes, options.idempotencyKey);
+    if (existing) {
+      await client.query("COMMIT");
+      return { row: existing, deduplicated: true };
+    }
+
+    const tags = await taglineValues(client, content, metadata);
+
+    const { rows } = await client.query<ThoughtRow>(
+      `INSERT INTO thoughts (content, embedding, metadata, project, supersedes, created_by, idempotency_key, ${TAGLINE_COLS})
+       VALUES ($1, $2::vector, $3::jsonb, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       RETURNING ${RETURNING_COLS}`,
+      [
+        content,
+        `[${embedding.join(",")}]`,
+        JSON.stringify(metadata),
+        proj,
+        supersedes ?? null,
+        by,
+        options.idempotencyKey ?? null,
+        ...tags,
+      ]
+    );
+
+    await client.query("COMMIT");
+    return { row: rows[0]!, deduplicated: false };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Batch counterpart. Dedups PER ITEM, not per batch: the S275 evidence shows whole
+ * batches retried wholesale (three duplicate pairs sharing one first-write timestamp),
+ * and a partially-succeeded batch must converge on re-send rather than duplicating the
+ * items that did land.
+ *
+ * One transaction and one advisory lock per item, taken in a STABLE order (sorted by
+ * hash) so two concurrent overlapping batches cannot deadlock by grabbing the same two
+ * locks in opposite orders.
+ */
+export async function captureThoughts(
+  pool: pg.Pool,
+  thoughts: BatchThoughtInput[],
+  options: CaptureOptions = {}
+): Promise<CaptureResult[]> {
+  const windowMinutes = options.dedupWindowMinutes ?? DEDUP_WINDOW_MINUTES;
+  const hashes = thoughts.map((t) => contentHash(t.content));
+  const results: CaptureResult[] = new Array(thoughts.length);
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    for (const h of [...new Set(hashes)].sort()) {
+      await lockOnHash(client, h);
+    }
+
+    for (let i = 0; i < thoughts.length; i++) {
+      const t = thoughts[i]!;
+      const proj = t.project ?? null;
+      const by = t.created_by ?? null;
+
+      const existing = await findDuplicate(client, hashes[i]!, proj, by, windowMinutes);
+      if (existing) {
+        results[i] = { row: existing, deduplicated: true };
+        continue;
+      }
+
+      const tags = await taglineValues(client, t.content, t.metadata);
+
+      const { rows } = await client.query<ThoughtRow>(
+        `INSERT INTO thoughts (content, embedding, metadata, project, created_by, ${TAGLINE_COLS})
+         VALUES ($1, $2::vector, $3::jsonb, $4, $5, $6, $7, $8, $9, $10)
+         RETURNING ${RETURNING_COLS}`,
+        [t.content, `[${t.embedding.join(",")}]`, JSON.stringify(t.metadata), proj, by, ...tags]
+      );
+      results[i] = { row: rows[0]!, deduplicated: false };
+    }
+
+    await client.query("COMMIT");
+    return results;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
 }

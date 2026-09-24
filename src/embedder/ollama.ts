@@ -8,6 +8,8 @@ import {
   type ThoughtMetadataExtracted,
   DEFAULT_METADATA,
   METADATA_PROMPT,
+  assertUsableEmbedding,
+  type EmbedderPing,
 } from "./types.js";
 
 export class OllamaEmbedder implements Embedder {
@@ -23,6 +25,38 @@ export class OllamaEmbedder implements Embedder {
     console.log(
       `[embedder] Ollama → ${this.endpoint} (embed: ${this.embedModel}, llm: ${this.llmModel})`
     );
+  }
+
+  /**
+   * Cheap liveness probe: GET /api/tags lists installed models. No inference, no
+   * model load, no cost -- ollama answers it from its own manifest.
+   *
+   * *** IT PROVES REACHABILITY, NOT CAPABILITY, AND THE DISTINCTION IS THE WHOLE
+   * REASON ops-ob1.capability EXISTS SEPARATELY. *** A wedged runner answers
+   * /api/tags perfectly while serving nothing (measured at S269). This makes the
+   * container healthcheck able to fail at all -- it does not make it a substitute
+   * for the real capability probe, and it must never be described as one.
+   */
+  async ping(): Promise<EmbedderPing> {
+    const started = Date.now();
+    try {
+      const res = await fetch(`${this.endpoint}/api/tags`, {
+        signal: AbortSignal.timeout(3000),
+      });
+      return {
+        provider: "ollama",
+        reachable: res.ok,
+        ms: Date.now() - started,
+        detail: res.ok ? undefined : `HTTP ${res.status}`,
+      };
+    } catch (err) {
+      return {
+        provider: "ollama",
+        reachable: false,
+        ms: Date.now() - started,
+        detail: String((err as Error)?.message ?? err).slice(0, 120),
+      };
+    }
   }
 
   async generateEmbedding(text: string): Promise<number[]> {
@@ -43,15 +77,14 @@ export class OllamaEmbedder implements Embedder {
     }
 
     const data = (await response.json()) as { embeddings?: number[][] };
-    const embedding = data.embeddings?.[0];
 
-    if (!embedding || embedding.length === 0) {
-      throw new Error(
-        `Ollama returned no vector for this content — likely empty, whitespace-only, or unsupported by ${this.embedModel} (content_bytes=${Buffer.byteLength(text, "utf8")})`
-      );
-    }
-
-    return embedding;
+    // S275: one shared guard for every provider. This path already refused an
+    // empty vector; it did NOT check dimensionality or finiteness, and the other
+    // two providers did not even check emptiness.
+    return assertUsableEmbedding(data.embeddings?.[0], {
+      model: this.embedModel,
+      contentBytes: Buffer.byteLength(text, "utf8"),
+    });
   }
 
   async extractMetadata(content: string): Promise<ThoughtMetadataExtracted> {

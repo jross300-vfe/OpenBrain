@@ -10,18 +10,21 @@ import { logger } from "hono/logger";
 
 import { getPool } from "../db/connection.js";
 import {
-  insertThought,
+  captureThought,
   searchThoughts,
   listThoughts,
+  countThoughts,
+  getThoughtById,
   getThoughtStats,
   updateThought,
   deleteThought,
-  batchInsertThoughts,
+  captureThoughts,
   searchThoughtsBySource,
   type ListFilters,
   type BatchThoughtInput,
 } from "../db/queries.js";
 import { getEmbedder } from "../embedder/index.js";
+import type { EmbedderPing } from "../embedder/types.js";
 import {
   validateCaptureInput,
   validateBatchInput,
@@ -30,7 +33,10 @@ import {
   isStrictIngestEnabled,
 } from "./validation.js";
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** Upper bound on one /memories/list page. `total` is always returned, so a caller can page past it. */
+const LIST_MAX_LIMIT = 1000;
+
+const UUID_RE =/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function createApi(): Hono {
   const app = new Hono();
@@ -52,7 +58,29 @@ export function createApi(): Hono {
 
   // ─── Health Check ────────────────────────────────────────────────
 
-  app.get("/health", (c) => {
+  /**
+   * Cached dependency probe (S275, task_1785713207341).
+   *
+   * The container HEALTHCHECK runs every 30s and a human may curl /health at any
+   * time, so the probe is cached: a healthcheck that hammers its dependency is a
+   * healthcheck that becomes part of the problem.
+   */
+  let depCache: { at: number; ping: EmbedderPing } | null = null;
+  const DEP_TTL_MS = 10_000;
+
+  async function probeDependency(): Promise<EmbedderPing> {
+    if (depCache && Date.now() - depCache.at < DEP_TTL_MS) return depCache.ping;
+    const ping: EmbedderPing = embedder.ping
+      ? await embedder.ping()
+      : // NOT PROBED, and it says so rather than defaulting to a pass. A provider
+        // with no free liveness endpoint (azure, openrouter) must not be billed
+        // every 30s just so a healthcheck can look thorough.
+        { provider: "unknown", reachable: null, ms: null, detail: "provider exposes no free liveness probe" };
+    depCache = { at: Date.now(), ping };
+    return ping;
+  }
+
+  app.get("/health", async (c) => {
     const capabilities = [
       "capture",
       "search",
@@ -67,11 +95,53 @@ export function createApi(): Hono {
       "embed-truncation-warning",
     ];
     if (isStrictIngestEnabled()) capabilities.push("strict-ingest");
+
+    // *** `status` DELIBERATELY STILL MEANS "THIS PROCESS IS UP". ***
+    // It is NOT widened to cover dependencies, because collect-ob1-health.mjs
+    // keys api_healthy off `status === "healthy"`, and ops-ob1.capability -- the
+    // estate's only `critical` seam -- derives its verdict from that. Widening it
+    // here would silently re-label a dead-ollama condition from `search-failed`
+    // to `api-unhealthy` on that seam. Same fact, different name, no announcement.
+    //
+    // What WAS wrong is that this endpoint reported nothing about its dependency
+    // at all, so a reader was actively misled during the S204 and S231 outages.
+    // `dependencies` fixes that without moving anyone's goalposts. The endpoint
+    // that actually FAILS is /health/deep, below.
+    const dependency = await probeDependency();
     return c.json({
       status: "healthy",
       service: "open-brain-api",
       capabilities,
+      dependencies: { embedder: dependency },
     });
+  });
+
+  /**
+   * Dependency-aware health, for the container HEALTHCHECK.
+   *
+   * *** THIS IS THE ONE THAT CAN GO RED. *** The Dockerfile HEALTHCHECK points
+   * here, so `docker inspect` finally reflects something that can fail --
+   * measured green through the S204 and S231 outages while search was dead.
+   *
+   * It proves REACHABILITY, not capability: a wedged runner answers /api/tags
+   * perfectly (S269). Complementary to ops-ob1.capability, never a substitute --
+   * what shipped there makes US know, this makes DOCKER act.
+   *
+   * A NOT-PROBED dependency is NOT a failure: a provider with no free liveness
+   * endpoint would otherwise be permanently unhealthy, which is the always-red
+   * class. Only a MEASURED false fails.
+   */
+  app.get("/health/deep", async (c) => {
+    const dependency = await probeDependency();
+    const degraded = dependency.reachable === false;
+    return c.json(
+      {
+        status: degraded ? "degraded" : "healthy",
+        service: "open-brain-api",
+        dependencies: { embedder: dependency },
+      },
+      degraded ? 503 : 200
+    );
   });
 
   // ─── Capture Memory ──────────────────────────────────────────────
@@ -96,8 +166,9 @@ export function createApi(): Hono {
       // Caller-supplied metadata wins over auto-extracted; both lose to `source` which
       // is canonicalised at the top level so we can index on it.
       const fullMetadata = { ...autoMetadata, ...input.metadata, source: input.source };
-      const result = await insertThought(
-        pool, input.content, embedding, fullMetadata, input.project, input.supersedes, input.created_by
+      const { row: result, deduplicated } = await captureThought(
+        pool, input.content, embedding, fullMetadata, input.project, input.supersedes,
+        input.created_by, { idempotencyKey: input.idempotency_key }
       );
 
       logWarnings(input.warnings, {
@@ -114,6 +185,9 @@ export function createApi(): Hono {
         people: (fullMetadata.people as string[] | undefined) ?? autoMetadata.people,
         project: result.project,
         captured_at: result.created_at.toISOString(),
+        // True when this request duplicated a recent identical capture and the ORIGINAL
+        // row was returned. Not an error: it is what makes retrying a timeout safe.
+        deduplicated,
         warnings: input.warnings,
       });
     } catch (err) {
@@ -156,7 +230,7 @@ export function createApi(): Hono {
         })
       );
 
-      const results = await batchInsertThoughts(pool, processed);
+      const results = await captureThoughts(pool, processed);
 
       for (const w of batch.warnings) {
         console.warn(
@@ -180,13 +254,15 @@ export function createApi(): Hono {
 
       return c.json({
         count: results.length,
+        deduplicated_count: results.filter((r) => r.deduplicated).length,
         envelope_warnings: batch.warnings,
-        results: results.map((r, i) => ({
+        results: results.map(({ row: r, deduplicated }, i) => ({
           id: r.id,
           content: r.content,
           metadata: r.metadata,
           project: r.project,
           captured_at: r.created_at.toISOString(),
+          deduplicated,
           warnings: batch.items[i]?.warnings ?? [],
         })),
       });
@@ -240,6 +316,7 @@ export function createApi(): Hono {
         query: body.query,
         count: results.length,
         results: results.map((r) => ({
+          id: r.id,
           content: r.content,
           metadata: r.metadata,
           similarity: Math.round(r.similarity * 1000) / 1000,
@@ -258,13 +335,32 @@ export function createApi(): Hono {
 
   // ─── List Memories ───────────────────────────────────────────────
 
+  // `limit` and `offset` used to be accepted in the body and silently dropped: the
+  // filters went through, the page size did not, so every call returned the default 50
+  // with `count: 50` reading like a total. A consumer asking for 200 rows of a 352-row
+  // class got 50 and believed it. The MCP list_thoughts tool paged correctly the whole
+  // time -- only this route was missed. Now mirrors it, and returns `total` so a caller
+  // can tell a full page from a complete answer.
   app.post("/memories/list", async (c) => {
     try {
-      const body = await c.req.json<ListFilters>();
-      const results = await listThoughts(pool, body);
+      const body = await c.req.json<ListFilters & { limit?: unknown; offset?: unknown }>();
+      const { limit: rawLimit, offset: rawOffset, ...filters } = body;
+      const limit = Math.min(
+        LIST_MAX_LIMIT,
+        Math.max(1, Number.isInteger(rawLimit) ? (rawLimit as number) : 50)
+      );
+      const offset = Math.max(0, Number.isInteger(rawOffset) ? (rawOffset as number) : 0);
+
+      const [results, total] = await Promise.all([
+        listThoughts(pool, filters, limit, offset),
+        countThoughts(pool, filters),
+      ]);
 
       return c.json({
         count: results.length,
+        total,
+        limit,
+        offset,
         results: results.map((r) => ({
           id: r.id,
           content: r.content,
@@ -293,25 +389,65 @@ export function createApi(): Hono {
       return c.json({ error: "id must be a valid UUID" }, 400);
     }
 
-    const body = await c.req.json<{ content: string }>();
+    const body = await c.req.json<{ content?: string; tags_line?: string }>();
 
-    if (!body.content || body.content.trim().length === 0) {
-      return c.json({ error: "content is required" }, 400);
+    const hasContent = typeof body.content === "string" && body.content.trim().length > 0;
+    const hasTagsLine = typeof body.tags_line === "string";
+
+    if (hasContent === hasTagsLine) {
+      return c.json({ error: "provide exactly one of content or tags_line" }, 400);
     }
 
     try {
-      const [embedding, metadata] = await Promise.all([
-        embedder.generateEmbedding(body.content),
-        embedder.extractMetadata(body.content),
-      ]);
+      let result;
+      let responseType: string | undefined;
+      let responseTopics: string[] | undefined;
+      let mode: string;
 
-      const result = await updateThought(pool, id, body.content, embedding, metadata);
+      if (hasTagsLine) {
+        // Tag-only update: splice the first line, keep body + metadata as-is.
+        // No metadata re-extraction — a tag flip must never disturb
+        // type/topics/source/provenance. Embedding regenerated (content changed).
+        const tagsLine = body.tags_line!;
+        if (tagsLine.trim().length === 0 || tagsLine.includes("\n")) {
+          return c.json({ error: "tags_line must be a non-empty single line" }, 400);
+        }
+
+        const thought = await getThoughtById(pool, id);
+        if (!thought) {
+          return c.json({ error: `Thought not found: ${id}` }, 404);
+        }
+
+        const newlineIdx = thought.content.indexOf("\n");
+        const bodyText = newlineIdx === -1 ? "" : thought.content.slice(newlineIdx);
+        const newContent = tagsLine + bodyText;
+
+        const embedding = await embedder.generateEmbedding(newContent);
+        result = await updateThought(pool, id, newContent, embedding, thought.metadata);
+        responseType = thought.metadata?.type;
+        responseTopics = thought.metadata?.topics;
+        mode = "tags_line";
+      } else {
+        // Full-content update: re-embed + re-extract; updateThought carries
+        // source + provenance over from the existing row.
+        const [embedding, metadata] = await Promise.all([
+          embedder.generateEmbedding(body.content!),
+          embedder.extractMetadata(body.content!),
+        ]);
+
+        result = await updateThought(pool, id, body.content!, embedding, metadata);
+        responseType = metadata.type;
+        responseTopics = metadata.topics;
+        mode = "content";
+      }
 
       return c.json({
         status: "updated",
+        mode,
         id: result.id,
-        type: metadata.type,
-        topics: metadata.topics,
+        type: responseType,
+        topics: responseTopics,
+        source: result.metadata?.source ?? null,
         content: result.content,
       });
     } catch (err) {

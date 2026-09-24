@@ -1,7 +1,7 @@
 /**
  * MCP Server for Open Brain.
- * Exposes seven tools: search_thoughts, list_thoughts, capture_thought, thought_stats,
- * update_thought, delete_thought, capture_thoughts (batch).
+ * Exposes eight tools: search_thoughts, list_thoughts, get_thought, capture_thought,
+ * thought_stats, update_thought, delete_thought, capture_thoughts (batch).
  *
  * Uses the official @modelcontextprotocol/sdk TypeScript SDK.
  */
@@ -15,13 +15,15 @@ import {
 
 import { getPool } from "../db/connection.js";
 import {
-  insertThought,
+  captureThought,
   searchThoughts,
   listThoughts,
+  countThoughts,
+  getThoughtById,
   getThoughtStats,
   updateThought,
   deleteThought,
-  batchInsertThoughts,
+  captureThoughts,
   type ListFilters,
   type BatchThoughtInput,
 } from "../db/queries.js";
@@ -133,7 +135,45 @@ export function createMcpServer(): Server {
               type: "string",
               description: "Filter results to thoughts created by a specific user",
             },
+            limit: {
+              type: "integer",
+              description:
+                "Maximum results per page (default: 50). Prefer small pages (10-25) on large corpora — full thought bodies are big, and oversized responses may overflow client-side buffers.",
+              default: 50,
+            },
+            offset: {
+              type: "integer",
+              description:
+                "Number of results to skip, for pagination (default: 0). Results are ordered most-recent-first; page with limit+offset until the returned count is less than limit, or use the total field.",
+              default: 0,
+            },
+            tags_contain: {
+              type: "string",
+              description:
+                "Case-insensitive substring filter against the FIRST line of content only (the canonical 'tags:' line), e.g. 'lesson:open'. Prose mentions of a tag deeper in the body do not match.",
+            },
+            minimal: {
+              type: "boolean",
+              description:
+                "When true, return only id, created_at, and the first line of content (the tags: line) per thought — ~10x smaller payload. Use for enumeration, then fetch full bodies via get_thought.",
+              default: false,
+            },
           },
+        },
+      },
+      {
+        name: "get_thought",
+        description:
+          "Fetch a single thought by its UUID, returning the full content and metadata. Companion to list_thoughts minimal mode: enumerate cheaply, then fetch full bodies one at a time.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            id: {
+              type: "string",
+              description: "UUID of the thought to fetch",
+            },
+          },
+          required: ["id"],
         },
       },
       {
@@ -163,6 +203,13 @@ export function createMcpServer(): Server {
               type: "string",
               description: "User who created this thought (optional, for multi-developer provenance)",
             },
+            idempotency_key: {
+              type: "string",
+              description:
+                "Optional. Reuse the SAME key when retrying a capture that timed out, to guarantee " +
+                "one row. Not required for safety: identical content captured within 10 minutes is " +
+                "deduplicated automatically and returns the original id with deduplicated:true.",
+            },
           },
           required: ["content"],
         },
@@ -188,7 +235,7 @@ export function createMcpServer(): Server {
       {
         name: "update_thought",
         description:
-          "Update an existing thought's content. Re-generates embedding and re-extracts metadata automatically.",
+          "Update an existing thought. Provide `content` for a full-content update (re-generates embedding and re-extracts metadata), or `tags_line` to replace ONLY the first line of content (the canonical 'tags:' line) — the rest of the body and all metadata are left untouched (embedding is regenerated). Provenance metadata (source, provenance) always survives updates. Exactly one of content/tags_line is required.",
         inputSchema: {
           type: "object" as const,
           properties: {
@@ -198,10 +245,15 @@ export function createMcpServer(): Server {
             },
             content: {
               type: "string",
-              description: "New content for the thought",
+              description: "New full content for the thought (mutually exclusive with tags_line)",
+            },
+            tags_line: {
+              type: "string",
+              description:
+                "Replacement for the first line of content only, e.g. flipping 'lesson:open' to 'lesson:incorporated' in the tags line. Body and metadata untouched. (mutually exclusive with content)",
             },
           },
-          required: ["id", "content"],
+          required: ["id"],
         },
       },
       {
@@ -288,6 +340,7 @@ export function createMcpServer(): Server {
           );
 
           const formatted = results.map((r) => ({
+            id: r.id,
             content: r.content,
             metadata: r.metadata,
             similarity: Math.round(r.similarity * 1000) / 1000,
@@ -314,22 +367,85 @@ export function createMcpServer(): Server {
             project: args?.project as string | undefined,
             created_by: args?.created_by as string | undefined,
             include_archived: (args?.include_archived as boolean) ?? false,
+            tags_contain: args?.tags_contain as string | undefined,
           };
 
-          const results = await listThoughts(pool, filters);
+          const limit = Math.max(1, (args?.limit as number) ?? 50);
+          const offset = Math.max(0, (args?.offset as number) ?? 0);
+          const minimal = (args?.minimal as boolean) ?? false;
 
-          const formatted = results.map((r) => ({
-            id: r.id,
-            content: r.content,
-            metadata: r.metadata,
-            created_at: r.created_at.toISOString(),
-          }));
+          const [results, total] = await Promise.all([
+            listThoughts(pool, filters, limit, offset),
+            countThoughts(pool, filters),
+          ]);
+
+          const formatted = results.map((r) =>
+            minimal
+              ? {
+                  id: r.id,
+                  tags_line: r.content.split("\n", 1)[0] ?? "",
+                  created_at: r.created_at.toISOString(),
+                }
+              : {
+                  id: r.id,
+                  content: r.content,
+                  metadata: r.metadata,
+                  created_at: r.created_at.toISOString(),
+                }
+          );
 
           return {
             content: [
               {
                 type: "text" as const,
-                text: JSON.stringify({ count: formatted.length, results: formatted }, null, 2),
+                text: JSON.stringify(
+                  { count: formatted.length, total, offset, limit, results: formatted },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+
+        // ── get_thought ──
+        case "get_thought": {
+          const id = args?.id as string;
+
+          if (!UUID_RE.test(id)) {
+            return {
+              content: [{ type: "text" as const, text: "Error: id must be a valid UUID" }],
+              isError: true,
+            };
+          }
+
+          const thought = await getThoughtById(pool, id);
+
+          if (!thought) {
+            return {
+              content: [{ type: "text" as const, text: `Error: Thought not found: ${id}` }],
+              isError: true,
+            };
+          }
+
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    id: thought.id,
+                    content: thought.content,
+                    metadata: thought.metadata,
+                    project: thought.project ?? null,
+                    created_by: thought.created_by ?? null,
+                    archived: thought.archived ?? false,
+                    supersedes: thought.supersedes ?? null,
+                    created_at: thought.created_at.toISOString(),
+                  },
+                  null,
+                  2
+                ),
               },
             ],
           };
@@ -357,8 +473,9 @@ export function createMcpServer(): Server {
           ]);
 
           const fullMetadata = { ...autoMetadata, ...input.metadata, source: input.source };
-          const result = await insertThought(
-            pool, input.content, embedding, fullMetadata, input.project, input.supersedes, input.created_by
+          const { row: result, deduplicated } = await captureThought(
+            pool, input.content, embedding, fullMetadata, input.project, input.supersedes,
+            input.created_by, { idempotencyKey: input.idempotency_key }
           );
 
           logWarnings(input.warnings, {
@@ -376,8 +493,12 @@ export function createMcpServer(): Server {
             type: "text" as const,
             text: JSON.stringify(
               {
-                status: "captured",
+                // "deduplicated" is NOT a failure: this request matched a recent
+                // identical capture, so the ORIGINAL row is returned. Do NOT retry, and
+                // do NOT treat the repeated id as an error -- that is the fix working.
+                status: deduplicated ? "deduplicated" : "captured",
                 id: result.id,
+                deduplicated,
                 type: (fullMetadata.type as string | undefined) ?? autoMetadata.type,
                 topics: (fullMetadata.topics as string[] | undefined) ?? autoMetadata.topics,
                 people: (fullMetadata.people as string[] | undefined) ?? autoMetadata.people,
@@ -412,7 +533,8 @@ export function createMcpServer(): Server {
         // ── update_thought ──
         case "update_thought": {
           const id = args?.id as string;
-          const content = args?.content as string;
+          const content = args?.content as string | undefined;
+          const tagsLine = args?.tags_line as string | undefined;
 
           if (!UUID_RE.test(id)) {
             return {
@@ -421,13 +543,70 @@ export function createMcpServer(): Server {
             };
           }
 
-          // Re-generate embedding and re-extract metadata
-          const [embedding, metadata] = await Promise.all([
-            embedder.generateEmbedding(content),
-            embedder.extractMetadata(content),
-          ]);
+          if ((content === undefined) === (tagsLine === undefined)) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: "Error: provide exactly one of content or tags_line",
+                },
+              ],
+              isError: true,
+            };
+          }
 
-          const result = await updateThought(pool, id, content, embedding, metadata);
+          let result;
+          let responseType: string | undefined;
+          let responseTopics: string[] | undefined;
+          let mode: string;
+
+          if (tagsLine !== undefined) {
+            // Tag-only update: splice the first line, keep body + metadata as-is.
+            // No metadata re-extraction — a tag flip must never disturb
+            // type/topics/source/provenance. Embedding is regenerated because
+            // content (including the tags line) is what got embedded.
+            if (tagsLine.trim().length === 0 || tagsLine.includes("\n")) {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: "Error: tags_line must be a non-empty single line",
+                  },
+                ],
+                isError: true,
+              };
+            }
+
+            const thought = await getThoughtById(pool, id);
+            if (!thought) {
+              return {
+                content: [{ type: "text" as const, text: `Error: Thought not found: ${id}` }],
+                isError: true,
+              };
+            }
+
+            const newlineIdx = thought.content.indexOf("\n");
+            const body = newlineIdx === -1 ? "" : thought.content.slice(newlineIdx);
+            const newContent = tagsLine + body;
+
+            const embedding = await embedder.generateEmbedding(newContent);
+            result = await updateThought(pool, id, newContent, embedding, thought.metadata);
+            responseType = thought.metadata?.type;
+            responseTopics = thought.metadata?.topics;
+            mode = "tags_line";
+          } else {
+            // Full-content update: re-generate embedding and re-extract metadata.
+            // updateThought carries source + provenance over from the existing row.
+            const [embedding, metadata] = await Promise.all([
+              embedder.generateEmbedding(content!),
+              embedder.extractMetadata(content!),
+            ]);
+
+            result = await updateThought(pool, id, content!, embedding, metadata);
+            responseType = metadata.type;
+            responseTopics = metadata.topics;
+            mode = "content";
+          }
 
           return {
             content: [
@@ -436,9 +615,11 @@ export function createMcpServer(): Server {
                 text: JSON.stringify(
                   {
                     status: "updated",
+                    mode,
                     id: result.id,
-                    type: metadata.type,
-                    topics: metadata.topics,
+                    type: responseType,
+                    topics: responseTopics,
+                    source: result.metadata?.source ?? null,
                     updated_at: result.created_at.toISOString(),
                   },
                   null,
@@ -504,7 +685,7 @@ export function createMcpServer(): Server {
             })
           );
 
-          const results = await batchInsertThoughts(pool, processed);
+          const results = await captureThoughts(pool, processed);
 
           for (const w of batch.warnings) {
             console.warn(
@@ -526,11 +707,12 @@ export function createMcpServer(): Server {
             });
           }
 
-          const formatted = results.map((r, i) => ({
+          const formatted = results.map(({ row: r, deduplicated }, i) => ({
             id: r.id,
             content: r.content,
             metadata: r.metadata,
             captured_at: r.created_at.toISOString(),
+            deduplicated,
             warnings: batch.items[i]?.warnings ?? [],
           }));
 
@@ -553,6 +735,7 @@ export function createMcpServer(): Server {
             text: JSON.stringify(
               {
                 count: formatted.length,
+                deduplicated_count: formatted.filter((f) => f.deduplicated).length,
                 envelope_warnings: batch.warnings,
                 results: formatted,
               },

@@ -10,8 +10,11 @@ import {
   insertThought,
   searchThoughts,
   listThoughts,
+  countThoughts,
+  getThoughtById,
   getThoughtStats,
   updateThought,
+  mergePreservedMetadata,
   deleteThought,
   batchInsertThoughts,
   type ThoughtMetadata,
@@ -202,6 +205,64 @@ describe("listThoughts", () => {
     expect(sql).toContain("created_by =");
   });
 
+  it("applies OFFSET for pagination", async () => {
+    const { pool, mockQuery } = createMockPool();
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+
+    await listThoughts(pool, {}, 20, 40);
+
+    const sql = mockQuery.mock.calls[0]![0] as string;
+    const params = mockQuery.mock.calls[0]![1] as unknown[];
+    expect(sql).toContain("OFFSET");
+    expect(params).toContain(20);
+    expect(params).toContain(40);
+  });
+
+  it("defaults to limit 50 offset 0", async () => {
+    const { pool, mockQuery } = createMockPool();
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+
+    await listThoughts(pool, {});
+
+    const params = mockQuery.mock.calls[0]![1] as unknown[];
+    expect(params).toContain(50);
+    expect(params).toContain(0);
+  });
+
+  // M3 (S280): tags_contain matches line 1 OR the migration-006 columns.
+  // BOTH halves are asserted, because dropping EITHER is a real regression with
+  // opposite symptoms -- losing the line half silently breaks every unpromoted
+  // token (topic:, role:, dp:), losing the column half silently restores the
+  // denominator hole M3 exists to close. A test naming only one half would pass
+  // through the very change it is supposed to catch.
+  it("filters by tags_contain against line 1 AND the promoted columns", async () => {
+    const { pool, mockQuery } = createMockPool();
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+
+    await listThoughts(pool, { tags_contain: "lesson:open" });
+
+    const sql = mockQuery.mock.calls[0]![0] as string;
+    const params = mockQuery.mock.calls[0]![1] as unknown[];
+    expect(sql).toContain("split_part(content, E'\\n', 1) ILIKE");
+    expect(sql).toContain("'lesson:' || lesson");
+    expect(sql).toContain("'class:' || class");
+    expect(sql).toMatch(/ILIKE \$\d+\)?\s*OR concat_ws/);
+    // one placeholder, used by both halves -- two would silently double-bind
+    expect(params.filter((p) => p === "%lesson:open%")).toHaveLength(1);
+  });
+
+  it("still scopes tags_contain to line 1, never the whole body", async () => {
+    const { pool, mockQuery } = createMockPool();
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+
+    await listThoughts(pool, { tags_contain: "lesson:open" });
+
+    const sql = mockQuery.mock.calls[0]![0] as string;
+    // the guard the original comment existed for: a bare `content ILIKE` would
+    // false-positive on any prose mention of the token further down the body.
+    expect(sql).not.toMatch(/[^)]\bcontent ILIKE/);
+  });
+
   it("includes archived when requested", async () => {
     const { pool, mockQuery } = createMockPool();
     mockQuery.mockResolvedValueOnce({ rows: [] });
@@ -210,6 +271,65 @@ describe("listThoughts", () => {
 
     const sql = mockQuery.mock.calls[0]![0] as string;
     expect(sql).not.toContain("archived = false");
+  });
+});
+
+// ─── countThoughts ──────────────────────────────────────────────────
+
+describe("countThoughts", () => {
+  it("counts with the same filters as listThoughts", async () => {
+    const { pool, mockQuery } = createMockPool();
+    mockQuery.mockResolvedValueOnce({ rows: [{ count: "87" }] });
+
+    const total = await countThoughts(pool, { tags_contain: "lesson:open" });
+
+    const sql = mockQuery.mock.calls[0]![0] as string;
+    expect(sql).toContain("COUNT(*)");
+    expect(sql).toContain("split_part(content, E'\\n', 1) ILIKE");
+    // countThoughts MUST carry the M3 column half too -- a count computed over a
+    // narrower predicate than the list it counts is the denominator hole again,
+    // one level down, and it would render as a plausible number rather than an error.
+    expect(sql).toContain("'lesson:' || lesson");
+    expect(total).toBe(87);
+  });
+
+  it("returns 0 on empty result", async () => {
+    const { pool, mockQuery } = createMockPool();
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+
+    const total = await countThoughts(pool, {});
+    expect(total).toBe(0);
+  });
+});
+
+// ─── getThoughtById ─────────────────────────────────────────────────
+
+describe("getThoughtById", () => {
+  it("selects by id and returns the row", async () => {
+    const { pool, mockQuery } = createMockPool();
+    const row = {
+      id: "11111111-2222-3333-4444-555555555555",
+      content: "tags: test\n\nbody",
+      metadata: {},
+      created_at: new Date(),
+    };
+    mockQuery.mockResolvedValueOnce({ rows: [row] });
+
+    const result = await getThoughtById(pool, row.id);
+
+    const sql = mockQuery.mock.calls[0]![0] as string;
+    const params = mockQuery.mock.calls[0]![1] as unknown[];
+    expect(sql).toContain("WHERE id = $1");
+    expect(params).toEqual([row.id]);
+    expect(result).toEqual(row);
+  });
+
+  it("returns null when not found", async () => {
+    const { pool, mockQuery } = createMockPool();
+    mockQuery.mockResolvedValueOnce({ rows: [] });
+
+    const result = await getThoughtById(pool, "11111111-2222-3333-4444-555555555555");
+    expect(result).toBeNull();
   });
 });
 
@@ -275,6 +395,8 @@ describe("updateThought", () => {
       supersedes: null,
       created_at: new Date(),
     };
+    // First call: SELECT existing metadata; second call: UPDATE
+    mockQuery.mockResolvedValueOnce({ rows: [{ metadata: { type: "decision" } }], rowCount: 1 });
     mockQuery.mockResolvedValueOnce({ rows: [row], rowCount: 1 });
 
     const result = await updateThought(
@@ -292,6 +414,101 @@ describe("updateThought", () => {
     await expect(
       updateThought(pool, "nonexistent", "content", [0.1], {})
     ).rejects.toThrow("Thought not found");
+  });
+
+  it("carries source + provenance over from the existing row (clobber regression)", async () => {
+    const { pool, mockQuery } = createMockPool();
+    const existingMetadata: ThoughtMetadata = {
+      type: "observation",
+      topics: ["old-topic"],
+      source: "session-75-clawdferret",
+      provenance: {
+        origin: "bulk-import",
+        original_id: "orig-42",
+        imported_at: "2026-05-01T00:00:00Z",
+      },
+    };
+    // Re-extracted metadata, as the embedder produces it: NO source/provenance.
+    const reExtracted: ThoughtMetadata = { type: "observation", topics: ["new-topic"] };
+
+    mockQuery.mockResolvedValueOnce({ rows: [{ metadata: existingMetadata }], rowCount: 1 });
+    mockQuery.mockResolvedValueOnce({
+      rows: [{ id: "abc-123", content: "updated", metadata: {}, created_at: new Date() }],
+      rowCount: 1,
+    });
+
+    await updateThought(pool, "abc-123", "updated", [0.1], reExtracted);
+
+    // Inspect the metadata actually sent to the UPDATE statement.
+    const updateCall = mockQuery.mock.calls[1]!;
+    const sentMetadata = JSON.parse(updateCall[1][3]) as ThoughtMetadata;
+    expect(sentMetadata.source).toBe("session-75-clawdferret");
+    expect(sentMetadata.provenance).toEqual(existingMetadata.provenance);
+    // Re-extracted keys still win for non-preserved fields.
+    expect(sentMetadata.topics).toEqual(["new-topic"]);
+  });
+
+  it("caller-supplied source wins over the existing row's source", async () => {
+    const { pool, mockQuery } = createMockPool();
+    mockQuery.mockResolvedValueOnce({
+      rows: [{ metadata: { source: "old-source" } }],
+      rowCount: 1,
+    });
+    mockQuery.mockResolvedValueOnce({
+      rows: [{ id: "abc-123", content: "x", metadata: {}, created_at: new Date() }],
+      rowCount: 1,
+    });
+
+    await updateThought(pool, "abc-123", "x", [0.1], { source: "explicit-new-source" });
+
+    const sentMetadata = JSON.parse(mockQuery.mock.calls[1]![1][3]) as ThoughtMetadata;
+    expect(sentMetadata.source).toBe("explicit-new-source");
+  });
+
+  it("handles null existing metadata without throwing", async () => {
+    const { pool, mockQuery } = createMockPool();
+    mockQuery.mockResolvedValueOnce({ rows: [{ metadata: null }], rowCount: 1 });
+    mockQuery.mockResolvedValueOnce({
+      rows: [{ id: "abc-123", content: "x", metadata: {}, created_at: new Date() }],
+      rowCount: 1,
+    });
+
+    await updateThought(pool, "abc-123", "x", [0.1], { type: "observation" });
+
+    const sentMetadata = JSON.parse(mockQuery.mock.calls[1]![1][3]) as ThoughtMetadata;
+    expect(sentMetadata.type).toBe("observation");
+    expect(sentMetadata.source).toBeUndefined();
+  });
+});
+
+// ─── mergePreservedMetadata ─────────────────────────────────────────
+
+describe("mergePreservedMetadata", () => {
+  it("preserves source and provenance when incoming omits them", () => {
+    const existing: ThoughtMetadata = {
+      source: "s1",
+      provenance: { origin: "import" },
+      topics: ["a"],
+    };
+    const merged = mergePreservedMetadata(existing, { type: "idea", topics: ["b"] });
+    expect(merged).toEqual({
+      type: "idea",
+      topics: ["b"],
+      source: "s1",
+      provenance: { origin: "import" },
+    });
+  });
+
+  it("does not resurrect non-preserved keys", () => {
+    const existing: ThoughtMetadata = { people: ["alice"], dates: ["2026-01-01"] };
+    const merged = mergePreservedMetadata(existing, { type: "idea" });
+    expect(merged.people).toBeUndefined();
+    expect(merged.dates).toBeUndefined();
+  });
+
+  it("returns incoming unchanged when existing is null or undefined", () => {
+    expect(mergePreservedMetadata(null, { type: "idea" })).toEqual({ type: "idea" });
+    expect(mergePreservedMetadata(undefined, { source: "s" })).toEqual({ source: "s" });
   });
 });
 

@@ -26,7 +26,7 @@ vi.mock("../../embedder/index.js", () => ({
 import { createMcpServer } from "../server.js";
 
 describe("MCP Server Tool Listing", () => {
-  it("registers exactly 7 tools", async () => {
+  it("registers exactly 8 tools", async () => {
     const server = createMcpServer();
 
     // Access tools via the server's internal handler
@@ -35,13 +35,14 @@ describe("MCP Server Tool Listing", () => {
     expect(handler).toBeDefined();
 
     const result = await handler({ method: "tools/list" });
-    expect(result.tools).toHaveLength(7);
+    expect(result.tools).toHaveLength(8);
 
     const toolNames = result.tools.map((t: any) => t.name).sort();
     expect(toolNames).toEqual([
       "capture_thought",
       "capture_thoughts",
       "delete_thought",
+      "get_thought",
       "list_thoughts",
       "search_thoughts",
       "thought_stats",
@@ -94,6 +95,33 @@ describe("MCP Server Tool Listing", () => {
     expect(props.created_by).toBeDefined();
   });
 
+  it("list_thoughts accepts pagination and projection params", async () => {
+    const server = createMcpServer();
+    const handler = (server as any)._requestHandlers?.get("tools/list");
+    const result = await handler({ method: "tools/list" });
+
+    const listTool = result.tools.find((t: any) => t.name === "list_thoughts");
+    const props = listTool.inputSchema.properties;
+
+    expect(props.limit).toBeDefined();
+    expect(props.limit.type).toBe("integer");
+    expect(props.offset).toBeDefined();
+    expect(props.offset.type).toBe("integer");
+    expect(props.tags_contain).toBeDefined();
+    expect(props.minimal).toBeDefined();
+    expect(props.minimal.type).toBe("boolean");
+  });
+
+  it("get_thought requires id", async () => {
+    const server = createMcpServer();
+    const handler = (server as any)._requestHandlers?.get("tools/list");
+    const result = await handler({ method: "tools/list" });
+
+    const getTool = result.tools.find((t: any) => t.name === "get_thought");
+    expect(getTool).toBeDefined();
+    expect(getTool.inputSchema.required).toEqual(["id"]);
+  });
+
   it("thought_stats accepts project param", async () => {
     const server = createMcpServer();
     const handler = (server as any)._requestHandlers?.get("tools/list");
@@ -104,13 +132,15 @@ describe("MCP Server Tool Listing", () => {
     expect(statsTool.inputSchema.properties.created_by).toBeDefined();
   });
 
-  it("update_thought requires id and content", async () => {
+  it("update_thought requires only id; content and tags_line are optional alternatives", async () => {
     const server = createMcpServer();
     const handler = (server as any)._requestHandlers?.get("tools/list");
     const result = await handler({ method: "tools/list" });
 
     const updateTool = result.tools.find((t: any) => t.name === "update_thought");
-    expect(updateTool.inputSchema.required).toEqual(["id", "content"]);
+    expect(updateTool.inputSchema.required).toEqual(["id"]);
+    expect(updateTool.inputSchema.properties.content).toBeDefined();
+    expect(updateTool.inputSchema.properties.tags_line).toBeDefined();
   });
 
   it("delete_thought requires id", async () => {
