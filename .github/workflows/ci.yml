@@ -34,30 +34,8 @@ jobs:
       - name: Test
         run: npm test
 
-  docker:
-    runs-on: ubuntu-latest
-    needs: build-and-test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:latest
-            ghcr.io/${{ github.repository }}:${{ github.sha }}
+  # The upstream `docker` job (GHCR publish) is removed on this fork. Its tag is
+  # ghcr.io/${{ github.repository }}, which is `jross300-vfe/OpenBrain` here --
+  # uppercase, so an invalid Docker reference and a red run on every master push,
+  # which the OB1 build gate reads as a refusal. The image is built on vfe-mule by
+  # phase1-5-build.sh, never pulled from GHCR, so nothing consumes this job.
