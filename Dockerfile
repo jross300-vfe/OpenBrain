@@ -19,7 +19,13 @@ WORKDIR /app
 
 # Install production dependencies only
 COPY package.json package-lock.json* ./
-RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
+RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force \
+    && rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
+              /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
+# S465 (task_1790726722682, ruled option (b)): the runtime stage carries NO npm. The base image's
+# bundled npm CLI shipped ip-address 10.1.0 (GHSA-v2v4-37r5-5v8g range) outside the app graph; the
+# app runs `node dist/index.js` and never needs npm at runtime. A scanner reading the IMAGE (not the
+# manifest) flags it, and Patch Tuesday's manifest audit cannot see it by construction.
 
 # Copy compiled output
 COPY --from=builder /app/dist ./dist
